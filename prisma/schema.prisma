@@ -1,0 +1,809 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../node_modules/.prisma/client"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model User {
+  id               String    @id @default(cuid())
+  email            String    @unique
+  password         String
+  name             String
+  phone            String?
+  role             String    @default("USER")
+  balance          Float     @default(0)
+  totalProfit      Float     @default(0)
+  totalDeposited   Float     @default(0)
+  totalWithdrawn   Float     @default(0)
+  emailVerified    Boolean   @default(false)
+  verifyCode       String?
+  verifyCodeExpiry DateTime?
+  kycStatus        String    @default("NONE")
+  kycFullName      String?
+  kycIdNumber      String?
+  kycDocumentType  String?
+  kycDocumentImage String?
+  kycSelfieImage   String?
+  kycSubmittedAt   DateTime?
+  kycVerifiedAt    DateTime?
+  kycRejectReason  String?
+  kycRejectCode    String?
+  kycCountry       String?
+  kycFrontImage    String?
+  kycBackImage     String?
+  kycVideoUrl      String?
+  kycAiStatus      String?   @default("NONE")
+  kycAiResult      String?
+  referralCode     String    @unique
+  referredByCode   String?
+  avatar           String?
+  newEmail         String?
+  emailChangeCode  String?
+  emailChangeExpiry DateTime?
+  isActive              Boolean   @default(true)
+  twoFactorSecret       String?
+  twoFactorEnabled      Boolean   @default(false)
+  lang                  String    @default("ar")
+  withdrawableBalance   Float     @default(0)
+  nonWithdrawableProfit Float     @default(0)
+  lockedCapital         Float     @default(0)
+  tokenVersion          Int       @default(1)
+  // ===== SECURITY FORTRESS FIELDS =====
+  isFrozen            Boolean    @default(false)
+  frozenUntil         DateTime?
+  freezeReason        String?
+  frozenAt            DateTime?
+  frozenBy            String?    // admin userId or 'system'
+  isBlacklisted       Boolean    @default(false)
+  blacklistReason     String?
+  blacklistedAt       DateTime?
+  redFlagCount        Int        @default(0)
+  monitoringLevel     String     @default("NORMAL") // NORMAL, ELEVATED, HIGH
+  lastVPNCheck        DateTime?
+  vpnDetected         Boolean    @default(false)
+  lastKnownIP         String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  investments       Investment[]
+  transactions      Transaction[]
+  chatConversations ChatConversation[]
+  referralsMade     Referral[]         @relation("UserReferrals")
+  referredBy        Referral[]         @relation("ReferredBy")
+  notifications     Notification[]
+  supportTickets    SupportTicket[]
+  tradingSessions   TradingSession[]
+  p2pSent           P2PTransfer[]      @relation("P2PSender")
+  p2pReceived       P2PTransfer[]      @relation("P2PReceiver")
+  adminSessions     AdminSession[]
+  auditLogs         AdminAuditLog[]
+  accountFreezes    AccountFreeze[]
+  redFlags          RedFlag[]
+  vpnDetections     VPNDetectionLog[]
+  loginIPs          UserLoginIP[]
+  deepScans         DeepAccountScan[]
+  commissions       CommissionLog[]
+}
+
+model Package {
+  id            String   @id @default(cuid())
+  name          String
+  nameEn        String
+  minAmount     Float
+  maxAmount     Float?
+  monthlyReturn Float
+  durationDays  Int      @default(30)
+  description   String
+  descriptionEn String
+  color         String
+  icon          String
+  isActive              Boolean  @default(true)
+  order                 Int      @default(0)
+  dailyWithdrawalLimit  Float    @default(0)
+  processingTimeHours   String   @default("1-24")
+  mode                  String   @default("BOTH")
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  investments Investment[]
+}
+
+model Investment {
+  id                    String    @id @default(cuid())
+  userId                String
+  packageId             String
+  amount                Float
+  monthlyProfit         Float
+  totalProfit           Float     @default(0)
+  releasedAmount        Float     @default(0)
+  monthsElapsed         Int       @default(0)
+  status                String    @default("ACTIVE")
+  startDate             DateTime  @default(now())
+  endDate               DateTime?
+  lastProfitDate        DateTime?
+  mode                  String    @default("SONA")
+  lockEndDate           DateTime?
+  nonWithdrawableProfit Float     @default(0)
+  withdrawableProfit    Float     @default(0)
+  lastWeeklyTransfer    DateTime?
+  lastDailyProfitDate   DateTime?
+  reinvested            Boolean   @default(false)
+  reinvestBonus         Float     @default(0)
+  poolShare             Float     @default(0)
+  poolContribution      Float     @default(0)
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  user     User     @relation(fields: [userId], references: [id])
+  package  Package  @relation(fields: [packageId], references: [id])
+  tradingSessions TradingSession[]
+}
+
+model Transaction {
+  id                String   @id @default(cuid())
+  userId            String
+  type              String
+  amount            Float
+  status            String   @default("PENDING")
+  method            String?
+  cryptoCurrency    String?
+  cryptoNetwork     String?
+  txHash            String?
+  walletAddress     String?
+  depositAddress    String?
+  nowpaymentsId     String?
+  nowpaymentsStatus String?
+  reference         String?
+  description       String?
+  details           String?
+  adminNote         String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id])
+  withdrawalQueue   WithdrawalQueue[]
+}
+
+model Referral {
+  id         String   @id @default(cuid())
+  referrerId String
+  referredId String
+  reward     Float    @default(5)
+  status     String   @default("PENDING")
+  createdAt  DateTime @default(now())
+
+  referrer User @relation("UserReferrals", fields: [referrerId], references: [id])
+  referred User @relation("ReferredBy", fields: [referredId], references: [id])
+}
+
+model DepositAddress {
+  id          String    @id @default(cuid())
+  userId      String?
+  currency    String
+  network     String
+  address     String
+  minAmount   Float     @default(10)
+  isActive    Boolean   @default(true)
+  lastChecked DateTime?
+}
+
+model SupportAgent {
+  id          String   @id @default(cuid())
+  name        String
+  nameEn      String
+  title       String
+  titleEn     String
+  avatar      String
+  specialty   String
+  specialtyEn String
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+
+  conversations ChatConversation[]
+}
+
+model ChatConversation {
+  id               String   @id @default(cuid())
+  userId           String
+  agentId          String?
+  status           String   @default("OPEN")
+  supportLevel     Int      @default(1)
+  isAiActive       Boolean  @default(true)
+  handoffReason    String?
+  lastUserMessageAt DateTime @default(now())
+  agentAssignedAt  DateTime?
+  resolutionAsked  Boolean  @default(false)
+  rating           Int?
+  ratingComment    String?
+  firstResponseAt  DateTime?
+  resolvedAt       DateTime?
+  category         String?
+  autoCloseNotified Boolean @default(false)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  user     User          @relation(fields: [userId], references: [id])
+  agent    SupportAgent? @relation(fields: [agentId], references: [id])
+  messages ChatMessage[]
+}
+
+model ChatMessage {
+  id              String   @id @default(cuid())
+  conversationId  String
+  senderType      String   @default("USER")
+  senderId        String
+  senderName      String?
+  message         String
+  imageUrl        String?
+  isRead          Boolean  @default(false)
+  isAgentMessage  Boolean  @default(false)
+  metadata        String?
+  createdAt       DateTime @default(now())
+
+  conversation ChatConversation @relation(fields: [conversationId], references: [id])
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  title     String
+  message   String
+  type      String   @default("SYSTEM")
+  data      String?
+  isRead    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+model SignalRecord {
+  id                   String    @id @default(cuid())
+  symbol               String
+  type                 String
+  entryPrice           Float
+  targetPrice          Float
+  targetPrice1         Float?
+  targetPrice2         Float?
+  targetPrice3         Float?
+  stopLoss             Float
+  confidence           Float
+  confluenceScore      Float?
+  regimeType           String?
+  mlAgreement          String?
+  bayesianConfidence   Float?
+  smcSignal            String?
+  volatilityPercentile Float?
+  kalmanTrend          String?
+  entropyScore         Float?
+  correlationNote      String?
+  fearGreedIndex       Int?
+  calibratedConfidence Float?
+  cooldownStatus       String?
+  riskBudget           String?
+  anomalyScore         Float?
+  status               String    @default("ACTIVE")
+  result               String?
+  createdAt            DateTime  @default(now())
+  closedAt             DateTime?
+}
+
+model PlatformSetting {
+  id    String @id @default(cuid())
+  key   String @unique
+  value String
+}
+
+model Pool {
+  id                 String    @id @default(cuid())
+  totalFunds         Float     @default(0)
+  totalProfit        Float     @default(0)
+  totalLoss          Float     @default(0)
+  platformCommission Float     @default(0)
+  activeTrades       Int       @default(0)
+  status             String    @default("ACTIVE")
+  lastTradeDate      DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  trades        PoolTrade[]
+  contributions PoolContribution[]
+}
+
+model PoolTrade {
+  id          String    @id @default(cuid())
+  poolId      String
+  symbol      String
+  direction   String
+  entryPrice  Float
+  exitPrice   Float?
+  amount      Float
+  profitLoss  Float     @default(0)
+  commission  Float     @default(0)
+  signalId    String?
+  status      String    @default("OPEN")
+  openedAt    DateTime  @default(now())
+  closedAt    DateTime?
+
+  pool Pool @relation(fields: [poolId], references: [id])
+}
+
+model PoolContribution {
+  id           String   @id @default(cuid())
+  poolId       String
+  userId       String
+  investmentId String
+  amount       Float
+  sharePercent Float    @default(0)
+  profitShare  Float    @default(0)
+  lossShare    Float    @default(0)
+  status       String   @default("ACTIVE")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  pool Pool @relation(fields: [poolId], references: [id])
+}
+
+model PlatformLog {
+  id        String   @id @default(cuid())
+  action    String
+  details   String?
+  adminId   String?
+  createdAt DateTime @default(now())
+}
+
+model SupportTicket {
+  id        String   @id @default(cuid())
+  userId    String
+  subject   String
+  category  String   @default("general")
+  priority  String   @default("medium")
+  status    String   @default("open")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user     User             @relation(fields: [userId], references: [id])
+  messages SupportMessage[]
+}
+
+model SupportMessage {
+  id         String   @id @default(cuid())
+  ticketId   String
+  userId     String
+  senderType String   @default("user")
+  content    String
+  imageUrl   String?
+  isRead     Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  ticket SupportTicket @relation(fields: [ticketId], references: [id])
+}
+
+model AgentConversation {
+  id        String   @id @default(cuid())
+  adminId   String
+  role      String
+  content   String
+  toolsUsed String?
+  metadata  String?
+  createdAt DateTime @default(now())
+}
+
+model AgentActionLog {
+  id        String   @id @default(cuid())
+  adminId   String
+  toolName  String
+  params    String?
+  result    String?
+  success   Boolean
+  duration  Int
+  createdAt DateTime @default(now())
+}
+
+model AgentQueue {
+  id             String    @id @default(cuid())
+  userId         String
+  conversationId String
+  position       Int
+  status         String
+  priority       String
+  createdAt      DateTime  @default(now())
+  assignedAt     DateTime?
+}
+
+model FacebookToken {
+  id          String   @id @default(cuid())
+  userId      String
+  accessToken String
+  pageId      String
+  pageName    String?
+  expiresAt   DateTime?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model SocialAccount {
+  id           String   @id @default(cuid())
+  userId       String
+  platform     String
+  accountId    String
+  accountName  String?
+  accessToken  String?
+  refreshToken String?
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model ContentPost {
+  id          String   @id @default(cuid())
+  userId      String
+  platform    String
+  content     String
+  status      String   @default("DRAFT")
+  scheduledAt DateTime?
+  publishedAt DateTime?
+  postId      String?
+  likes       Int      @default(0)
+  comments    Int      @default(0)
+  shares      Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model MarketingCampaign {
+  id          String   @id @default(cuid())
+  userId      String
+  name        String
+  description String?
+  status      String   @default("DRAFT")
+  startDate   DateTime?
+  endDate     DateTime?
+  budget      Float    @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// ===== TRADING SYSTEM =====
+
+model TradingSession {
+  id            String    @id @default(cuid())
+  userId        String
+  investmentId  String
+  symbol        String    @default("BTC/USDT")
+  status        String    @default("ACTIVE")
+  startPrice    Float     @default(0)
+  currentPrice  Float     @default(0)
+  totalProfit   Float     @default(0)
+  totalTrades   Int       @default(0)
+  winTrades     Int       @default(0)
+  lossTrades    Int       @default(0)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  user       User       @relation(fields: [userId], references: [id])
+  investment Investment @relation(fields: [investmentId], references: [id])
+  trades     BotTrade[]
+}
+
+model BotTrade {
+  id              String    @id @default(cuid())
+  sessionId       String
+  type            String    // BUY or SELL
+  symbol          String    @default("BTC/USDT")
+  entryPrice      Float
+  exitPrice       Float?
+  amount          Float
+  profitLoss      Float     @default(0)
+  status          String    @default("CLOSED") // OPEN, CLOSED
+  confidence      Float     @default(0)
+  stopLoss        Float?
+  takeProfit      Float?
+  takeProfit2     Float?
+  takeProfit3     Float?
+  quantity        Float     @default(0)
+  isManual        Boolean   @default(false)
+  leverage        Int       @default(1)
+  marginType      String    @default("cross")
+  openedAt        DateTime  @default(now())
+  closedAt        DateTime?
+
+  session TradingSession @relation(fields: [sessionId], references: [id])
+}
+
+model P2PTransfer {
+  id          String   @id @default(cuid())
+  fromUserId  String
+  toUserId    String
+  amount      Float
+  fee         Float    @default(0)
+  status      String   @default("COMPLETED")
+  description String?
+  createdAt   DateTime @default(now())
+
+  fromUser User @relation("P2PSender", fields: [fromUserId], references: [id])
+  toUser   User @relation("P2PReceiver", fields: [toUserId], references: [id])
+}
+
+// ===== ADMIN ADVANCED SYSTEM =====
+
+model AdminAuditLog {
+  id          String   @id @default(cuid())
+  adminId     String
+  action      String
+  targetId    String?
+  targetType  String?   // USER, TRANSACTION, INVESTMENT, SETTING, etc.
+  details     String?
+  ipAddress   String?
+  userAgent   String?
+  createdAt   DateTime @default(now())
+
+  admin User @relation(fields: [adminId], references: [id])
+}
+
+model AdminSession {
+  id           String    @id @default(cuid())
+  adminId      String
+  token        String
+  ipAddress    String?
+  userAgent    String?
+  twoFactorVerified Boolean @default(false)
+  expiresAt    DateTime
+  createdAt    DateTime  @default(now())
+
+  admin User @relation(fields: [adminId], references: [id])
+}
+
+model WithdrawalQueue {
+  id                String   @id @default(cuid())
+  transactionId     String
+  stage             String   @default("AUTO_REVIEW") // AUTO_REVIEW, PENDING_MANUAL, APPROVED, REJECTED, PROCESSING, COMPLETED
+  autoApproved      Boolean  @default(false)
+  reviewedBy        String?
+  reviewedAt        DateTime?
+  dynamicMessage    String?
+  priority          Int      @default(0)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  transaction Transaction @relation(fields: [transactionId], references: [id])
+}
+
+model BotControl {
+  id                String   @id @default(cuid())
+  isActive          Boolean  @default(true)
+  tradesPerMinute   Float    @default(2.0)
+  winRate           Float    @default(0.72)
+  maxTradeAmount    Float    @default(500)
+  minTradeAmount    Float    @default(10)
+  volatilityFactor  Float    @default(1.0)
+  symbols           String   @default("BTC/USDT,ETH/USDT")
+  pausedAt          DateTime?
+  updatedAt         DateTime @updatedAt
+}
+
+// ===== SECURITY SYSTEM =====
+
+model SecurityLog {
+  id          String   @id @default(cuid())
+  ip          String
+  type        String   // XSS_DETECTED, SQL_INJECTION, RATE_LIMIT_EXCEEDED, BRUTE_FORCE, etc.
+  path        String
+  details     String?
+  severity    String   @default("LOW") // LOW, MEDIUM, HIGH, CRITICAL
+  userId      String?
+  userAgent   String?
+  fingerprint String?
+  createdAt   DateTime @default(now())
+}
+
+model SuspiciousActivity {
+  id              String   @id @default(cuid())
+  userId          String?
+  ip              String
+  activityType    String   // MULTIPLE_FAILED_LOGINS, RAPID_REQUESTS, UNUSUAL_LOCATION, VPN_DETECTED, etc.
+  description     String
+  riskScore       Int      @default(0) // 0-100
+  isResolved      Boolean  @default(false)
+  resolvedBy      String?
+  resolvedAt      DateTime?
+  metadata        String?  // JSON string with additional context
+  createdAt       DateTime @default(now())
+}
+
+model AccountLockout {
+  id              String    @id @default(cuid())
+  identifier      String    @unique // email or IP
+  failCount       Int       @default(0)
+  lockedUntil     DateTime?
+  lastFailAt      DateTime?
+  lockReason      String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+}
+
+model IPBlocklist {
+  id          String   @id @default(cuid())
+  ip          String   @unique
+  reason      String
+  blockedBy   String?  // admin userId or 'system'
+  isAutoBlock Boolean  @default(false)
+  expiresAt   DateTime?
+  createdAt   DateTime @default(now())
+}
+
+model SecuritySetting {
+  id    String @id @default(cuid())
+  key   String @unique
+  value String
+}
+
+// ===== SECURITY FORTRESS SYSTEM =====
+
+model AccountFreeze {
+  id              String    @id @default(cuid())
+  userId          String
+  reason          String
+  frozenBy        String?   // admin userId or 'system'
+  frozenAt        DateTime  @default(now())
+  unfreezeAt      DateTime  // When the 3-day freeze period ends
+  status          String    @default("ACTIVE") // ACTIVE, COMPLETED, ESCALATED_TO_BAN
+  scanResult      String?   // JSON: results of the deep scan
+  scanCompletedAt DateTime?
+  platformDamage  Boolean   @default(false) // Did the deep scan find platform damage?
+  damageDetails   String?   // Details of what damage was found
+  autoUnfroze     Boolean   @default(false) // Was it auto-unfroze after 3 days?
+  escalatedToBan  Boolean   @default(false) // Was account banned after scan?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+model RedFlag {
+  id          String   @id @default(cuid())
+  userId      String
+  reason      String
+  reasonCode  String   // VPN_DETECTED, PROXY_DETECTED, SUSPICIOUS_IP, SAME_IP_ACCOUNTS, etc.
+  ip          String?
+  details     String?  // JSON: additional metadata
+  isRead      Boolean  @default(false) // Has the user seen this flag?
+  source      String   @default("system") // system, admin, auto
+  createdAt   DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+model VPNDetectionLog {
+  id              String   @id @default(cuid())
+  userId          String
+  ip              String
+  isVPN           Boolean
+  isProxy         Boolean
+  isTor           Boolean
+  isp             String?
+  organization    String?
+  country         String?
+  city            String?
+  riskScore       Int      @default(0)
+  detectionMethod String?  // ip-api, ipqualityscore, behavioral, multi-check
+  userAgent       String?
+  redFlagIssued   Boolean  @default(false) // Was a red flag issued for this detection?
+  createdAt       DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+model UserLoginIP {
+  id          String   @id @default(cuid())
+  userId      String
+  ip          String
+  userAgent   String?
+  country     String?
+  city        String?
+  isp         String?
+  isVPN       Boolean  @default(false)
+  isProxy     Boolean  @default(false)
+  isSuspicious Boolean @default(false)
+  loginAt     DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+model DeepAccountScan {
+  id                String   @id @default(cuid())
+  userId            String
+  freezeId          String?  // Reference to AccountFreeze
+  scanType          String   @default("FREEZE_3DAY") // FREEZE_3DAY, MANUAL, PERIODIC
+  status            String   @default("PENDING") // PENDING, IN_PROGRESS, COMPLETED
+  // Scan Results
+  totalTransactions Int      @default(0)
+  suspiciousTxCount Int      @default(0)
+  balanceAnomaly    Boolean  @default(false)
+  loginAnomaly      Boolean  @default(false)
+  ipAnomaly         Boolean  @default(false)
+  vpnUsageCount     Int      @default(0)
+  sameIPAccountCount Int     @default(0)
+  referralFraudScore Float   @default(0)
+  overallRiskScore  Float    @default(0) // 0-100
+  platformDamage    Boolean  @default(false)
+  damageDetails     String?  // JSON
+  recommendation    String?  // UNFREEZE, BAN, MONITOR
+  scanData          String?  // JSON: full scan data
+  startedAt         DateTime?
+  completedAt       DateTime?
+  createdAt         DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+model BlacklistEntry {
+  id            String    @id @default(cuid())
+  targetType    String    // USER, IP, EMAIL
+  targetValue   String    // userId, IP address, or email
+  reason        String
+  source        String    @default("system") // system, admin, auto_scan
+  isPermanent   Boolean   @default(true)
+  expiresAt     DateTime? // null = permanent
+  relatedUserId String?   // If targeting IP, which user triggered it
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+// ===== ENGINE SYSTEM =====
+
+model EngineConfig {
+  id                String   @id @default(cuid())
+  engineType        String   @unique // MARKET_MOVER, LIQUIDITY_LOCKER, INVESTMENT_BOT
+  enabled           Boolean  @default(false)
+  config            String   // JSON string with engine-specific config
+  lastUpdatedBy     String?  // admin userId
+  updatedAt         DateTime @updatedAt
+}
+
+model CommissionLog {
+  id            String   @id @default(cuid())
+  userId        String   // who receives the commission
+  fromUserId    String   // who triggered the commission
+  level         Int      // 1, 2, or 3
+  amount        Float
+  type          String   // REFERRAL_BONUS, LEVEL1_INVESTMENT, LEVEL2_COMMISSION, LEVEL3_COMMISSION
+  investmentId  String?  // related investment if applicable
+  status        String   @default("CREDITED")
+  createdAt     DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+// ===== RATE LIMIT & IDEMPOTENCY =====
+
+model RateLimitAttempt {
+  id          String   @id @default(cuid())
+  identifier  String   // IP or userId
+  action      String   // login, otp, p2p_transfer, withdrawal, invest, etc.
+  success     Boolean  @default(false)
+  ip          String?
+  userAgent   String?
+  createdAt   DateTime @default(now())
+
+  @@index([identifier, action, createdAt])
+  @@map("rate_limit_attempts")
+}
+
+model IdempotencyKey {
+  id          String   @id @default(cuid())
+  key         String   @unique
+  userId      String
+  action      String
+  result      String?  // JSON string of result
+  createdAt   DateTime @default(now())
+  expiresAt   DateTime
+
+  @@index([key])
+  @@map("idempotency_keys")
+}

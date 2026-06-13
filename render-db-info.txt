@@ -1,0 +1,2 @@
+DB_INTERNAL=postgresql://sona_db_jbfn_user:FLeaeFOE10CmZ37HDwyDcqThQNR87Sux@dpg-d8l25sf7f7vs73fi85gg-a/sona_db_jbfn
+DB_EXTERNAL=postgresql://sona_db_jbfn_user:FLeaeFOE10CmZ37HDwyDcqThQNR87Sux@dpg-d8l25sf7f7vs73fi85gg-a.oregon-postgres.render.com/sona_db_jbfn

@@ -1,0 +1,42 @@
+name: Keep Render Awake
+
+on:
+  schedule:
+    # Run every 5 minutes (minimum GitHub allows is 5 min)
+    - cron: '*/5 * * * *'
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Ping Render App
+        run: |
+          echo "Pinging SONA Platform on Render..."
+          
+          # Ping the lightweight /api/ping endpoint
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X HEAD \
+            -H "User-Agent: GitHub-Actions-KeepAlive/1.0" \
+            --max-time 10 \
+            https://sona-platform.onrender.com/api/ping)
+          
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✅ Ping successful (HTTP $HTTP_CODE)"
+          else
+            echo "⚠️ Ping returned HTTP $HTTP_CODE, trying full health check..."
+            
+            # Fallback: try the health endpoint with GET
+            HTTP_CODE2=$(curl -s -o /dev/null -w "%{http_code}" \
+              --max-time 15 \
+              https://sona-platform.onrender.com/api/health)
+            
+            if [ "$HTTP_CODE2" = "200" ]; then
+              echo "✅ Health check successful (HTTP $HTTP_CODE2 - cold start resolved)"
+            else
+              echo "❌ Both endpoints failed. Render may be deploying."
+            fi
+          fi
+          
+          echo "Ping completed at $(date -u)"

@@ -1,0 +1,26 @@
+# ═══════════════════════════════════════════════════════════
+# Cloudflare CDN Configuration for SONA Platform
+# Place this file at the root of your domain (sona.yourdomain.com/_cloudflare)
+# or use it as reference when configuring Cloudflare Dashboard
+# ═══════════════════════════════════════════════════════════
+
+# Cache static assets aggressively
+# Next.js static files have content hashes = safe to cache forever
+/_next/static/* {
+  Cache-Control: public, max-age=31536000, immutable
+}
+
+# Cache images and fonts for 1 day
+/*.png, *.jpg, *.jpeg, *.gif, *.svg, *.ico, *.webp, *.woff, *.woff2, *.ttf {
+  Cache-Control: public, max-age=86400, stale-while-revalidate=604800
+}
+
+# Never cache API responses (they are dynamic)
+/api/* {
+  Cache-Control: no-store, no-cache, must-revalidate
+}
+
+# Cache the homepage and static pages for 5 minutes
+/, /about, /terms, /privacy {
+  Cache-Control: public, max-age=300, stale-while-revalidate=3600
+}

@@ -1,0 +1,580 @@
+import { NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
+import { SecurityHeadersManager } from '@/lib/security-headers';
+
+// ═══════════════════════════════════════════════════════════
+// RATE LIMITING (in-memory, lightweight for middleware)
+// NOTE: DB-backed rate limiting (DBRateLimiter) is used in route handlers
+// where Prisma/Node.js APIs are available. The middleware keeps this
+// lightweight in-memory layer for Edge Runtime fast-path blocking.
+// ═══════════════════════════════════════════════════════════
+
+interface RateEntry { count: number; resetAt: number; blocked: boolean; blockedUntil: number }
+const rateStore = new Map<string, RateEntry>()
+
+// Clean every 5 min
+setInterval(() => {
+  const now = Date.now()
+  for (const [k, v] of rateStore.entries()) {
+    if (v.blockedUntil < now && v.resetAt < now) rateStore.delete(k)
+  }
+}, 5 * 60 * 1000)
+
+function checkRate(ip: string, pathname: string): boolean {
+  let maxReqs = 60, windowMs = 60000, blockMs = 300000
+  if (pathname.includes('/api/auth/login')) { maxReqs = 10; windowMs = 900000; blockMs = 900000 }
+  else if (pathname.includes('/api/auth/register')) { maxReqs = 5; windowMs = 3600000; blockMs = 3600000 }
+  else if (pathname.includes('/api/admin/agent')) { maxReqs = 30; windowMs = 60000; blockMs = 300000 }
+  else if (pathname.includes('/api/admin')) { maxReqs = 120; windowMs = 60000; blockMs = 300000 }
+  else if (pathname.includes('/api/support')) { maxReqs = 30; windowMs = 60000; blockMs = 300000 }
+  else if (pathname.includes('/api/deposit') || pathname.includes('/api/withdraw')) { maxReqs = 10; windowMs = 60000; blockMs = 600000 }
+  else if (pathname.includes('/api/p2p/transfer')) { maxReqs = 5; windowMs = 60000; blockMs = 600000 }
+  else if (pathname.includes('/api/p2p/validate')) { maxReqs = 20; windowMs = 60000; blockMs = 300000 }
+  else if (pathname.includes('/api/invest')) { maxReqs = 10; windowMs = 60000; blockMs = 600000 }
+  else if (pathname.includes('/api/kyc')) { maxReqs = 5; windowMs = 60000; blockMs = 600000 }
+  else if (pathname.includes('/api/user/change-password')) { maxReqs = 3; windowMs = 300000; blockMs = 900000 }
+  else if (pathname.includes('/api/user/change-email')) { maxReqs = 3; windowMs = 300000; blockMs = 900000 }
+  else if (pathname.includes('/api/user/delete')) { maxReqs = 2; windowMs = 300000; blockMs = 900000 }
+  else if (pathname.includes('/api/balance/reconcile')) { maxReqs = 3; windowMs = 300000; blockMs = 600000 }
+  else if (pathname.includes('/api/security/dashboard')) { maxReqs = 30; windowMs = 60000; blockMs = 300000 }
+  else if (pathname.includes('/api/security/incidents')) { maxReqs = 20; windowMs = 60000; blockMs = 300000 }
+
+  const key = `${ip}:${pathname}`
+  const now = Date.now()
+  let entry = rateStore.get(key)
+
+  if (!entry || entry.resetAt < now) {
+    entry = { count: 0, resetAt: now + windowMs, blocked: false, blockedUntil: 0 }
+  }
+
+  if (entry.blocked && entry.blockedUntil > now) return false
+
+  entry.count++
+  if (entry.count > maxReqs) {
+    entry.blocked = true
+    entry.blockedUntil = now + blockMs
+    rateStore.set(key, entry)
+    return false
+  }
+
+  rateStore.set(key, entry)
+  return true
+}
+
+// ═══════════════════════════════════════════════════════════
+// XSS / SQL INJECTION / PATH TRAVERSAL / COMMAND INJECTION DETECTION
+// ═══════════════════════════════════════════════════════════
+
+const THREAT_PATTERNS = [
+  // XSS patterns
+  /<script[\s>]/i, /<\/script/i,
+  /javascript\s*:/i, /javascript%3a/i,
+  /on(click|load|error|mouseover|focus|blur|submit|change|input|keydown|keyup|mouseenter|mouseleave)\s*=/i,
+  /<iframe[\s>]/i, /<object[\s>]/i, /<embed[\s>]/i,
+  /<img[^>]+onerror/i, /<svg[^>]+onload/i,
+  /eval\s*\(/i, /expression\s*\(/i,
+  /document\.(cookie|write|domain|location)/i,
+  /window\.(location|open|eval|close)/i,
+  /alert\s*\(/i, /prompt\s*\(/i, /confirm\s*\(/i,
+  /vbscript\s*:/i, /data\s*:\s*text\/html/i,
+
+  // SQL Injection patterns
+  /(\bunion\b\s+\bselect\b)/i, /(\binsert\b\s+\binto\b)/i,
+  /(\bdelete\b\s+\bfrom\b)/i, /(\bdrop\b\s+\btable\b)/i,
+  /(\bupdate\b\s+\w+\s+\bset\b)/i, /(\balter\b\s+\btable\b)/i,
+  /(1\s*=\s*1)/i, /(1\s*OR\s+1)/i,
+  /('\s*(or|OR)\s+')/i, /(\bexec\b\s*\()/i,
+  /(\bxp_cmdshell\b)/i, /(\binformation_schema\b)/i,
+  /(char\s*\(\s*\d+\s*\))/i, /('\s*;\s*-\s*-)/i,
+
+  // Path traversal
+  /\.\.\//i, /\.\.\\/i, /%2e%2e%2f/i, /%2e%2e\//i,
+  /\/etc\/passwd/i, /\/proc\/self/i, /\/var\/log/i,
+
+  // Command injection
+  /;\s*(rm|cat|ls|chmod|bash|sh|wget|curl|python|perl|ruby|nc|ncat|dd|mkfifo)\b/i,
+  /\|\s*(rm|cat|ls|chmod|bash|sh|wget|curl)\b/i,
+  /`[^`]*`/, /\$\([^)]*\)/,
+
+  // SSRF patterns
+  /(http|https):\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|169\.254|10\.\d|172\.(1[6-9]|2\d|3[01])|192\.168)/i,
+
+  // LDAP injection
+  /(\*\)|\(\|)/i,
+
+  // XML injection
+  /<!\[CDATA/i, /<!ENTITY/i,
+]
+
+function detectThreats(input: string): boolean {
+  if (!input) return false
+  const decoded = decodeURIComponent(input).replace(/\+/g, ' ')
+  const normalizedInput = input.replace(/\+/g, ' ')
+  return THREAT_PATTERNS.some(p => p.test(input) || p.test(decoded) || p.test(normalizedInput))
+}
+
+// ═══════════════════════════════════════════════════════════
+// BLOCKED IPs (in-memory)
+// ═══════════════════════════════════════════════════════════
+
+const blockedIPs = new Map<string, number>() // ip -> blockedUntil
+
+export function blockIPMiddleware(ip: string, durationMs: number = 3600000) {
+  blockedIPs.set(ip, Date.now() + durationMs)
+}
+
+function isBlocked(ip: string): boolean {
+  const until = blockedIPs.get(ip)
+  if (!until) return false
+  if (Date.now() > until) { blockedIPs.delete(ip); return false }
+  return true
+}
+
+// ═══════════════════════════════════════════════════════════
+// TOKEN VALIDATION (Edge-compatible)
+// ═══════════════════════════════════════════════════════════
+
+function hasValidTokenFormat(token: string): boolean {
+  if (!token || typeof token !== 'string') return false
+  const parts = token.split('.')
+  if (parts.length !== 3) return false
+  if (parts.some(p => p.length === 0)) return false
+  try {
+    const payload = JSON.parse(atob(parts[1]))
+    if (payload.exp && Date.now() / 1000 > payload.exp) return false
+    if (!payload.userId && !payload.email) return false
+    return true
+  } catch {
+    return false
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// FORTRESS V2 - Lightweight Edge-Compatible Threat Detection
+// ═══════════════════════════════════════════════════════════
+
+interface FortressV2LightweightResult {
+  threatScore: number
+  threatLevel: 'NONE' | 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
+  factors: string[]
+  shouldBlock: boolean
+  requiresChallenge: boolean
+}
+
+const fortressRequestPatterns = new Map<string, {
+  timestamps: number[]
+  endpoints: Set<string>
+  userAgents: Set<string>
+}>()
+
+setInterval(() => {
+  const now = Date.now()
+  const oneHourAgo = now - 3600000
+  for (const [key, pattern] of fortressRequestPatterns.entries()) {
+    pattern.timestamps = pattern.timestamps.filter(t => t > oneHourAgo)
+    if (pattern.timestamps.length === 0) {
+      fortressRequestPatterns.delete(key)
+    }
+  }
+}, 10 * 60 * 1000)
+
+function fortressV2LightweightAnalysis(
+  ip: string,
+  userAgent: string,
+  endpoint: string,
+  method: string
+): FortressV2LightweightResult {
+  const factors: string[] = []
+  let score = 0
+  const now = Date.now()
+
+  const key = ip
+  const pattern = fortressRequestPatterns.get(key) || {
+    timestamps: [],
+    endpoints: new Set<string>(),
+    userAgents: new Set<string>(),
+  }
+
+  pattern.timestamps.push(now)
+  pattern.endpoints.add(endpoint)
+  pattern.userAgents.add(userAgent)
+
+  if (pattern.timestamps.length > 100) {
+    pattern.timestamps = pattern.timestamps.slice(-50)
+  }
+
+  fortressRequestPatterns.set(key, pattern)
+
+  const recentTimestamps = pattern.timestamps.filter(t => now - t < 60000)
+  if (recentTimestamps.length > 60) {
+    score += 25
+    factors.push('HIGH_REQUEST_FREQUENCY')
+  } else if (recentTimestamps.length > 30) {
+    score += 10
+    factors.push('ELEVATED_REQUEST_FREQUENCY')
+  }
+
+  if (pattern.timestamps.length >= 5) {
+    const intervals: number[] = []
+    for (let i = pattern.timestamps.length - 5; i < pattern.timestamps.length - 1; i++) {
+      if (i >= 0) intervals.push(pattern.timestamps[i + 1] - pattern.timestamps[i])
+    }
+    if (intervals.length >= 4) {
+      const mean = intervals.reduce((a, b) => a + b, 0) / intervals.length
+      const variance = intervals.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / intervals.length
+      if (variance < 50 && mean < 200) {
+        score += 35
+        factors.push('AUTOMATION_DETECTED')
+      }
+    }
+  }
+
+  if (pattern.endpoints.size > 30) {
+    score += 20
+    factors.push('RAPID_ENDPOINT_ENUMERATION')
+  }
+
+  if (pattern.userAgents.size > 5) {
+    score += 15
+    factors.push('MULTIPLE_USER_AGENTS')
+  }
+
+  const sensitivePatterns = ['/admin/config', '/admin/secrets', '/debug', '/internal', '/env', '/keys']
+  if (sensitivePatterns.some(p => endpoint.includes(p))) {
+    score += 30
+    factors.push('SENSITIVE_ENDPOINT_PROBING')
+  }
+
+  if (method === 'POST') {
+    const financialEndpoints = ['/withdraw', '/transfer', '/invest', '/deposit']
+    if (financialEndpoints.some(e => endpoint.includes(e))) {
+      score += 5
+    }
+  }
+
+  let threatLevel: FortressV2LightweightResult['threatLevel'] = 'NONE'
+  if (score >= 75) threatLevel = 'CRITICAL'
+  else if (score >= 50) threatLevel = 'HIGH'
+  else if (score >= 25) threatLevel = 'MEDIUM'
+  else if (score >= 10) threatLevel = 'LOW'
+
+  const shouldBlock = score >= 75
+  const requiresChallenge = score >= 50 && score < 75
+
+  return {
+    threatScore: Math.min(100, score),
+    threatLevel,
+    factors,
+    shouldBlock,
+    requiresChallenge,
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// STEALTH INFRASTRUCTURE - Header Sanitization
+// ═══════════════════════════════════════════════════════════
+
+function sanitizeResponseHeaders(response: NextResponse): void {
+  response.headers.delete('X-Powered-By')
+  response.headers.delete('X-AspNet-Version')
+  response.headers.delete('X-Runtime')
+  response.headers.delete('X-Version')
+  response.headers.delete('X-Backend-Server')
+  response.headers.delete('X-Served-By')
+  response.headers.delete('Via')
+}
+
+// ═══════════════════════════════════════════════════════════
+// ROUTE PATTERNS
+// ═══════════════════════════════════════════════════════════
+
+const PROTECTED_PATTERNS = [
+  /^\/api\/admin/,
+  /^\/api\/invest/,
+  /^\/api\/withdraw/,
+  /^\/api\/deposit(?!\/generate-address)/,
+  /^\/api\/kyc/,
+  /^\/api\/user\/[^/]+/,
+  /^\/api\/user\/change-password/,
+  /^\/api\/user\/profile/,
+  /^\/api\/user\/avatar/,
+  /^\/api\/user\/delete/,
+  /^\/api\/user\/change-email/,
+  /^\/api\/profits\/calculate/,
+  /^\/api\/cron/,
+  /^\/api\/support(?!\/$)/,
+  /^\/api\/referrals/,
+  /^\/api\/notifications(?!\/$)/,
+  /^\/api\/transactions/,
+  /^\/api\/withdrawals/,
+  /^\/api\/deposits/,
+  /^\/api\/trading/,
+  /^\/api\/p2p/,
+  /^\/api\/security\/(freeze|blacklist|red-flag|scan|fortress|auto-detect|dashboard|incidents)/,
+  /^\/api\/security\/my-flags/,
+  /^\/api\/security\/csrf-token/,
+]
+
+const PUBLIC_PATTERNS = [
+  /^\/api\/auth/,
+  /^\/api\/error-log/,
+  /^\/api\/packages(?!\/seed)/,
+  /^\/api\/market/,
+  /^\/api\/nowpayments\/ipn/,
+  /^\/api\/nowpayments\/status/,
+  /^\/api\/news/,
+  /^\/api\/signals/,
+  /^\/api\/referral\/image/,
+
+]
+
+// ═══════════════════════════════════════════════════════════
+// MAIN MIDDLEWARE
+// ═══════════════════════════════════════════════════════════
+
+export function middleware(request: NextRequest) {
+  const { pathname } = request.nextUrl
+  const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
+    || request.headers.get('x-real-ip') || 'unknown'
+  const ua = request.headers.get('user-agent') || ''
+  const method = request.method
+
+  // ── Generate CSP nonce ──
+  const cspNonce = SecurityHeadersManager.generateNonce()
+
+  // ── 0. HONEYPOT CHECK ──
+  const HONEYPOT_ENDPOINTS = [
+    '/api/admin/config', '/api/admin/secrets', '/api/admin/database',
+    '/api/debug', '/api/internal', '/api/v1/admin', '/api/backup',
+    '/api/export-all', '/api/users/all', '/api/system/info',
+    '/api/env', '/api/keys', '/.env', '/.git', '/wp-admin',
+    '/phpmyadmin', '/server-status', '/actuator',
+  ]
+  if (HONEYPOT_ENDPOINTS.some(hp => pathname.toLowerCase() === hp || pathname.toLowerCase().startsWith(hp + '/'))) {
+    console.error(`[HONEYPOT] CRITICAL: ${ip} accessed honeypot endpoint ${pathname}`)
+    blockIPMiddleware(ip, 86400000)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+  }
+
+  // ── 0.5 GEOGRAPHIC PROBING DETECTION ──
+  const probingAgents = ['shodan', 'censys', 'zoomeye', 'fofa', 'goby', 'nmap', 'masscan', 'zgrab', 'httpx', 'nuclei', 'wappalyzer']
+  if (probingAgents.some(a => ua.toLowerCase().includes(a))) {
+    console.error(`[CLOAK] Probing tool detected from ${ip}: ${ua}`)
+    blockIPMiddleware(ip, 86400000)
+    return NextResponse.json({ error: 'تم حظر الوصول' }, { status: 403 })
+  }
+
+  // ── 0.6 FORTRESS V2 - Lightweight Threat Detection ──
+  const fortressResult = fortressV2LightweightAnalysis(ip, ua, pathname, method)
+
+  if (fortressResult.shouldBlock) {
+    console.warn(`[FORTRESS-V2] BLOCKED: ${ip} threat score ${fortressResult.threatScore} - ${fortressResult.factors.join(', ')}`)
+    blockIPMiddleware(ip, 3600000)
+    const errorVariants = [
+      { error: 'تم حظر الوصول' },
+      { message: 'تم حظر الوصول', status: 'blocked' },
+      { detail: 'Access denied', code: 403 },
+    ]
+    const variant = errorVariants[Math.floor(Math.random() * errorVariants.length)]
+    return NextResponse.json(variant, { status: 403 })
+  }
+
+  // ── 1. IP Block Check ──
+  if (isBlocked(ip)) {
+    console.warn(`[SECURITY] Blocked IP accessed: ${ip}`)
+    return NextResponse.json({ error: 'تم حظر الوصول' }, { status: 403 })
+  }
+
+  // ── 2. URL Threat Detection ──
+  const fullUrl = pathname + request.nextUrl.search
+  if (detectThreats(decodeURIComponent(fullUrl))) {
+    console.warn(`[SECURITY] Threat detected from ${ip}: ${fullUrl}`)
+    const criticalPatterns = [
+      /(\bunion\b\s+\bselect\b)/i, /(\bdrop\b\s+\btable\b)/i,
+      /(;\s*(rm|cat|chmod|bash|sh|wget|curl|python|perl|ruby|nc)\b)/i,
+      /(`[^`]*`)/, /\$\([^)]*\)/,
+      /\/etc\/passwd/i, /\/proc\/self/i,
+    ]
+    if (criticalPatterns.some(p => p.test(fullUrl))) {
+      blockIPMiddleware(ip, 3600000)
+      return NextResponse.json({ error: 'تم حظر الطلب لأسباب أمنية' }, { status: 403 })
+    }
+  }
+
+  // ── 3. Suspicious User-Agent ──
+  const badAgents = ['sqlmap', 'nikto', 'metasploit', 'dirbuster', 'hydra', 'wpscan', 'gobuster', 'ffuf', 'acunetix', 'nessus', 'openvas', 'w3af', 'arachni']
+  if (badAgents.some(a => ua.toLowerCase().includes(a))) {
+    console.warn(`[SECURITY] Suspicious UA from ${ip}: ${ua}`)
+    blockIPMiddleware(ip, 3600000)
+    return NextResponse.json({ error: 'تم حظر الوصول' }, { status: 403 })
+  }
+
+  // ── 4. API Routes ──
+  if (pathname.startsWith('/api/')) {
+    // Rate Limiting
+    if (!checkRate(ip, pathname)) {
+      return NextResponse.json({ error: 'طلبات كثيرة جداً. حاول لاحقاً.' }, { status: 429 })
+    }
+
+    // Request body size check
+    const contentLength = parseInt(request.headers.get('content-length') || '0', 10)
+    const isUpload = pathname.includes('/upload') || pathname.includes('/avatar') || pathname.includes('/kyc')
+    const maxSize = isUpload ? 10 * 1024 * 1024 : 1024 * 1024
+    if (contentLength > maxSize) {
+      return NextResponse.json({ error: 'حجم الطلب كبير جداً' }, { status: 413 })
+    }
+
+    // Integrity token check for sensitive POST requests
+    if ((method === 'POST' || method === 'PUT' || method === 'DELETE') && contentLength > 0) {
+      const sensitiveEndpoints = ['/withdraw', '/transfer', '/invest', '/deposit', '/change-password', '/change-email', '/delete', '/freeze', '/blacklist']
+      const isSensitiveEndpoint = sensitiveEndpoints.some(e => pathname.includes(e))
+      if (isSensitiveEndpoint) {
+        const integrityToken = request.headers.get('x-integrity-token')
+        if (!integrityToken) {
+          console.warn(`[FORTRESS-V2] Missing integrity token for sensitive endpoint: ${pathname} from ${ip}`)
+        }
+      }
+    }
+
+    // CSRF token check for state-changing requests
+    const needsAuthForCSRF = PROTECTED_PATTERNS.some(p => p.test(pathname))
+    if ((method === 'POST' || method === 'PUT' || method === 'DELETE') && needsAuthForCSRF) {
+      const csrfExemptRoutes = [
+        '/api/auth/login',
+        '/api/auth/register',
+        '/api/auth/send-verify',
+        '/api/auth/verify-email',
+        '/api/nowpayments/ipn',
+        '/api/cron/',
+        '/api/support/messages',
+      ]
+      const isCSRFExempt = csrfExemptRoutes.some(r => pathname.startsWith(r))
+      if (!isCSRFExempt) {
+        const csrfToken = request.headers.get('x-csrf-token')
+        if (!csrfToken) {
+          console.warn(`[CSRF] Missing CSRF token for ${method} ${pathname} from ${ip}`)
+        }
+      }
+    }
+
+    // Public routes
+    const isPublic = PUBLIC_PATTERNS.some(p => p.test(pathname))
+    if (isPublic) {
+      const response = NextResponse.next()
+      addSecurityHeaders(response, pathname, cspNonce)
+      sanitizeResponseHeaders(response)
+      response.headers.set('X-Fortress-V2-Score', fortressResult.threatScore.toString())
+      response.headers.set('X-Fortress-V2-Level', fortressResult.threatLevel)
+      response.headers.set('X-CSP-Nonce', cspNonce)
+      return response
+    }
+
+    // Protected routes - require auth
+    const needsAuth = PROTECTED_PATTERNS.some(p => p.test(pathname))
+    if (needsAuth) {
+      const xInternal = request.headers.get('x-internal')
+      const authHeader = request.headers.get('authorization')
+      const cronSecret = process.env.CRON_SECRET
+
+      if (xInternal === 'true' && cronSecret && authHeader === `Bearer ${cronSecret}`) {
+        const response = NextResponse.next()
+        addSecurityHeaders(response, pathname, cspNonce)
+        sanitizeResponseHeaders(response)
+        response.headers.set('X-Fortress-V2-Score', fortressResult.threatScore.toString())
+        response.headers.set('X-Fortress-V2-Level', fortressResult.threatLevel)
+        response.headers.set('X-CSP-Nonce', cspNonce)
+        return response
+      }
+
+      const cookieToken = request.cookies.get('token')?.value
+      let hasToken = false
+
+      if (authHeader?.startsWith('Bearer ') && !xInternal) {
+        const token = authHeader.substring(7)
+        if (hasValidTokenFormat(token)) hasToken = true
+      }
+
+      if (!hasToken && cookieToken) {
+        if (hasValidTokenFormat(cookieToken)) hasToken = true
+      }
+
+      if (!hasToken) {
+        return NextResponse.json({ error: 'يرجى تسجيل الدخول أولاً' }, { status: 401 })
+      }
+    }
+
+    // Unknown API routes require auth
+    if (!isPublic && !needsAuth) {
+      const cookieToken = request.cookies.get('token')?.value
+      const authHeader = request.headers.get('authorization')
+      let hasToken = false
+      if (authHeader?.startsWith('Bearer ')) {
+        const token = authHeader.substring(7)
+        if (hasValidTokenFormat(token)) hasToken = true
+      }
+      if (!hasToken && cookieToken) {
+        if (hasValidTokenFormat(cookieToken)) hasToken = true
+      }
+      if (!hasToken) {
+        return NextResponse.json({ error: 'يرجى تسجيل الدخول أولاً' }, { status: 401 })
+      }
+    }
+
+    const response = NextResponse.next()
+    addSecurityHeaders(response, pathname, cspNonce)
+    sanitizeResponseHeaders(response)
+    response.headers.set('X-Fortress-V2-Score', fortressResult.threatScore.toString())
+    response.headers.set('X-Fortress-V2-Level', fortressResult.threatLevel)
+    response.headers.set('X-CSP-Nonce', cspNonce)
+    return response
+  }
+
+  // ── 5. Non-API routes (pages, images, static) ──
+  const response = NextResponse.next()
+  const isImage = /\.(png|jpg|jpeg|gif|svg|ico|webp|bmp)$/i.test(pathname)
+  const isFont = /\.(woff|woff2|ttf|otf|eot)$/i.test(pathname)
+  const isJS = /\.(js|mjs|cjs)$/i.test(pathname)
+  const isCSS = /\.css$/i.test(pathname)
+  const isStaticAsset = isImage || isFont || isJS || isCSS
+
+  if (isStaticAsset) {
+    // Static assets: ONLY set cross-origin headers, nothing else
+    // This ensures images, JS, CSS, and fonts load through tunnels/CDNs
+    response.headers.set('Cross-Origin-Resource-Policy', 'cross-origin')
+    // Remove any restrictive headers that might block loading
+    response.headers.delete('Cross-Origin-Embedder-Policy')
+    response.headers.delete('Cross-Origin-Opener-Policy')
+  } else {
+    // HTML pages: lightweight security headers that don't break React hydration
+    response.headers.set('X-Frame-Options', 'DENY')
+    response.headers.set('X-Content-Type-Options', 'nosniff')
+    response.headers.set('Cross-Origin-Resource-Policy', 'cross-origin')
+    response.headers.set('Cross-Origin-Opener-Policy', 'same-origin')
+    // Do NOT add CSP here - let next.config.ts handle it
+    // Do NOT add Permissions-Policy here - let next.config.ts handle it
+    // Do NOT add Referrer-Policy here - let next.config.ts handle it
+  }
+  return response
+}
+
+function addSecurityHeaders(response: NextResponse, pathname: string, nonce?: string) {
+  const isAPI = pathname.startsWith('/api/')
+  const isStaticImage = /\.(png|jpg|jpeg|gif|svg|ico|webp)$/i.test(pathname)
+
+  if (isAPI) {
+    SecurityHeadersManager.applyToHeaders(response.headers, 'api')
+  } else if (isStaticImage) {
+    SecurityHeadersManager.applyToHeaders(response.headers, 'static')
+  } else {
+    SecurityHeadersManager.applyToHeaders(response.headers, 'page', nonce)
+  }
+
+  // Remove server-identifying headers but DON'T set empty values
+  response.headers.delete('X-Powered-By')
+  // Remove the X-Request-ID header if it was set (don't set empty)
+  response.headers.delete('X-Request-ID')
+}
+
+export const config = {
+  matcher: ['/((?!_next/static|_next/image|favicon.ico|public).*)'],
+}

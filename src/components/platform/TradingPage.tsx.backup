@@ -1,0 +1,3538 @@
+'use client'
+
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react'
+import { useAppStore } from '@/lib/store'
+import { useI18n } from '@/hooks/useI18n'
+import { motion, AnimatePresence } from 'framer-motion'
+
+// ===== THEME (Pixel-perfect match to reference image) =====
+const T = {
+  bg: '#121212',
+  bg2: '#1E1E1E',
+  card: '#1E1E1E',
+  cardHover: '#2A2A2A',
+  surface: '#2A2A2A',
+  border: '#2A2A2A',
+  borderLight: '#333333',
+  input: '#1E1E1E',
+  accent: '#2563EB',
+  accentHover: '#1D4ED8',
+  accentBg: 'rgba(37,99,235,0.15)',
+  accentBorder: 'rgba(37,99,235,0.4)',
+  green: '#00FF7F',
+  greenBg: 'rgba(0,255,127,0.10)',
+  greenBorder: 'rgba(0,255,127,0.25)',
+  red: '#FF3B30',
+  redBg: 'rgba(255,59,48,0.10)',
+  redBorder: 'rgba(255,59,48,0.25)',
+  blue: '#2563EB',
+  blueBg: 'rgba(37,99,235,0.15)',
+  blueBorder: 'rgba(37,99,235,0.4)',
+  purple: '#9333EA',
+  cyan: '#00BCD4',
+  cyanBg: 'rgba(0,188,212,0.10)',
+  cyanBorder: 'rgba(0,188,212,0.25)',
+  orange: '#F59E0B',
+  textPrimary: '#FFFFFF',
+  textSecondary: '#8A8A8A',
+  textMuted: '#666666',
+}
+
+// ===== TYPES =====
+interface CandleData {
+  time: string; open: number; high: number; low: number; close: number; volume: number
+}
+interface BinanceTicker {
+  symbol: string; price: number; change: number; high24h: number; low24h: number;
+  volume24h: number; quoteVolume24h: number
+}
+interface PositionData {
+  id: string; type: string; symbol: string; entryPrice: number; exitPrice: number | null;
+  amount: number; profitLoss: number; status: string; confidence: number;
+  stopLoss: number | null; takeProfit: number | null; quantity: number;
+  isManual: boolean; openedAt: string; closedAt: string | null;
+  leverage?: number; marginType?: string;
+  sessionSymbol?: string; investmentAmount?: number;
+}
+interface OrderBookEntry { price: number; amount: number; total: number }
+
+// ===== HELPERS =====
+const fmt = (n: number | undefined | null) =>
+  new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n ?? 0)
+const fmtPrice = (n: number) =>
+  n >= 1000 ? new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n) : n.toFixed(4)
+const fmtPct = (n: number) => `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`
+const fmtVol = (n: number) => {
+  if (n >= 1e9) return `${(n / 1e9).toFixed(2)}B`
+  if (n >= 1e6) return `${(n / 1e6).toFixed(2)}M`
+  if (n >= 1e3) return `${(n / 1e3).toFixed(2)}K`
+  return n.toFixed(2)
+}
+const fmtTime = (dateStr: string) => {
+  try { return new Date(dateStr).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }) } catch { return '' }
+}
+const fmtDateTime = (dateStr: string) => {
+  try { return new Date(dateStr).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false }) } catch { return '' }
+}
+
+// ===== PAIRS =====
+const PAIRS = [
+  { symbol: 'BTCUSDT', label: 'BTC/USDT', icon: '₿', decimals: 2, nameAr: 'بيتكوين' },
+  { symbol: 'ETHUSDT', label: 'ETH/USDT', icon: 'Ξ', decimals: 2, nameAr: 'إيثريوم' },
+  { symbol: 'BNBUSDT', label: 'BNB/USDT', icon: '◆', decimals: 2, nameAr: 'بي إن بي' },
+  { symbol: 'SOLUSDT', label: 'SOL/USDT', icon: '◎', decimals: 3, nameAr: 'سولانا' },
+  { symbol: 'XRPUSDT', label: 'XRP/USDT', icon: 'X', decimals: 4, nameAr: 'ريبل' },
+]
+const TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d']
+
+// ===== INDICATOR CALCULATIONS =====
+function calcSMA(data: number[], period: number): (number | null)[] {
+  const result: (number | null)[] = []
+  for (let i = 0; i < data.length; i++) {
+    if (i < period - 1) { result.push(null); continue }
+    let sum = 0
+    for (let j = i - period + 1; j <= i; j++) sum += data[j]
+    result.push(sum / period)
+  }
+  return result
+}
+
+function calcEMA(data: number[], period: number): (number | null)[] {
+  const result: (number | null)[] = []
+  const k = 2 / (period + 1)
+  for (let i = 0; i < data.length; i++) {
+    if (i < period - 1) { result.push(null); continue }
+    if (i === period - 1) {
+      let sum = 0
+      for (let j = 0; j < period; j++) sum += data[j]
+      result.push(sum / period)
+      continue
+    }
+    const prev = result[i - 1]!
+    result.push(data[i] * k + prev * (1 - k))
+  }
+  return result
+}
+
+function calcBollingerBands(data: number[], period: number = 20, stdDev: number = 2) {
+  const sma = calcSMA(data, period)
+  const upper: (number | null)[] = []
+  const lower: (number | null)[] = []
+  for (let i = 0; i < data.length; i++) {
+    if (sma[i] === null) { upper.push(null); lower.push(null); continue }
+    let sumSqDiff = 0
+    for (let j = i - period + 1; j <= i; j++) {
+      sumSqDiff += (data[j] - sma[i]!) ** 2
+    }
+    const sd = Math.sqrt(sumSqDiff / period)
+    upper.push(sma[i]! + stdDev * sd)
+    lower.push(sma[i]! - stdDev * sd)
+  }
+  return { middle: sma, upper, lower }
+}
+
+function calcRSI(data: number[], period: number = 14): (number | null)[] {
+  const result: (number | null)[] = []
+  if (data.length < period + 1) return data.map(() => null)
+  let avgGain = 0, avgLoss = 0
+  for (let i = 1; i <= period; i++) {
+    const change = data[i] - data[i - 1]
+    if (change > 0) avgGain += change; else avgLoss += Math.abs(change)
+  }
+  avgGain /= period; avgLoss /= period
+  for (let i = 0; i < period; i++) result.push(null)
+  const rs = avgLoss === 0 ? 100 : avgGain / avgLoss
+  result.push(100 - 100 / (1 + rs))
+  for (let i = period + 1; i < data.length; i++) {
+    const change = data[i] - data[i - 1]
+    const gain = change > 0 ? change : 0
+    const loss = change < 0 ? Math.abs(change) : 0
+    avgGain = (avgGain * (period - 1) + gain) / period
+    avgLoss = (avgLoss * (period - 1) + loss) / period
+    const rs2 = avgLoss === 0 ? 100 : avgGain / avgLoss
+    result.push(100 - 100 / (1 + rs2))
+  }
+  return result
+}
+
+function calcMACD(data: number[], fast: number = 12, slow: number = 26, signal: number = 9) {
+  const emaFast = calcEMA(data, fast)
+  const emaSlow = calcEMA(data, slow)
+  const macdLine: (number | null)[] = []
+  for (let i = 0; i < data.length; i++) {
+    if (emaFast[i] === null || emaSlow[i] === null) { macdLine.push(null); continue }
+    macdLine.push(emaFast[i]! - emaSlow[i]!)
+  }
+  const macdValues = macdLine.filter(v => v !== null) as number[]
+  const signalLine = calcEMA(macdValues, signal)
+  const signalResult: (number | null)[] = []
+  let idx = 0
+  for (let i = 0; i < macdLine.length; i++) {
+    if (macdLine[i] === null) { signalResult.push(null); continue }
+    signalResult.push(signalLine[idx] ?? null)
+    idx++
+  }
+  const histogram: (number | null)[] = []
+  for (let i = 0; i < macdLine.length; i++) {
+    if (macdLine[i] === null || signalResult[i] === null) { histogram.push(null); continue }
+    histogram.push(macdLine[i]! - signalResult[i]!)
+  }
+  return { macdLine, signalLine: signalResult, histogram }
+}
+
+function calcStochastic(candles: CandleData[], kPeriod: number = 14, dPeriod: number = 3, smoothing: number = 3) {
+  const rawK: (number | null)[] = []
+  for (let i = 0; i < candles.length; i++) {
+    if (i < kPeriod - 1) { rawK.push(null); continue }
+    let highest = -Infinity, lowest = Infinity
+    for (let j = i - kPeriod + 1; j <= i; j++) {
+      if (candles[j].high > highest) highest = candles[j].high
+      if (candles[j].low < lowest) lowest = candles[j].low
+    }
+    const range = highest - lowest
+    rawK.push(range === 0 ? 50 : ((candles[i].close - lowest) / range) * 100)
+  }
+  const smoothK: (number | null)[] = []
+  for (let i = 0; i < rawK.length; i++) {
+    if (rawK[i] === null) { smoothK.push(null); continue }
+    let sum = 0, count = 0
+    for (let j = Math.max(0, i - smoothing + 1); j <= i; j++) {
+      if (rawK[j] !== null) { sum += rawK[j]!; count++ }
+    }
+    smoothK.push(count > 0 ? sum / count : null)
+  }
+  const dLine: (number | null)[] = []
+  for (let i = 0; i < smoothK.length; i++) {
+    if (smoothK[i] === null || i < kPeriod - 1 + smoothing - 1) { dLine.push(null); continue }
+    let sum = 0, count = 0
+    for (let j = i - dPeriod + 1; j <= i; j++) {
+      if (smoothK[j] !== null) { sum += smoothK[j]!; count++ }
+    }
+    dLine.push(count === dPeriod ? sum / dPeriod : null)
+  }
+  return { kLine: smoothK, dLine }
+}
+
+function calcATR(candles: CandleData[], period: number = 14): (number | null)[] {
+  const result: (number | null)[] = []
+  if (candles.length < 2) return candles.map(() => null)
+  const trueRanges: number[] = [candles[0].high - candles[0].low]
+  for (let i = 1; i < candles.length; i++) {
+    const tr1 = candles[i].high - candles[i].low
+    const tr2 = Math.abs(candles[i].high - candles[i - 1].close)
+    const tr3 = Math.abs(candles[i].low - candles[i - 1].close)
+    trueRanges.push(Math.max(tr1, tr2, tr3))
+  }
+  result.push(null)
+  for (let i = 1; i < period; i++) result.push(null)
+  let atr = 0
+  for (let i = 1; i <= period; i++) atr += trueRanges[i]
+  atr /= period
+  result.push(atr)
+  for (let i = period + 1; i < candles.length; i++) {
+    atr = (atr * (period - 1) + trueRanges[i]) / period
+    result.push(atr)
+  }
+  return result
+}
+
+// ===== DRAWING TOOLS TYPES =====
+interface DrawingLine {
+  id: string; type: 'horizontal' | 'trend' | 'rectangle';
+  startX: number; startY: number;
+  endX: number; endY: number;
+}
+
+// ===== LIGHTWEIGHT CHARTS WRAPPER =====
+function SonaChart({
+  candles, selectedPair, isAr, openPositions, drawings, onDrawingsChange, activeDrawTool, onSetActiveDrawTool,
+  showEMA, showBB, showRSI, showMACD, showStoch, showATR, showSignalLines,
+  chartHeight,
+}: {
+  candles: CandleData[]
+  selectedPair: typeof PAIRS[0]
+  isAr: boolean
+  openPositions?: PositionData[]
+  drawings?: DrawingLine[]
+  onDrawingsChange?: (d: DrawingLine[]) => void
+  activeDrawTool?: string | null
+  onSetActiveDrawTool?: (tool: string | null) => void
+  showEMA: boolean
+  showBB: boolean
+  showRSI: boolean
+  showMACD: boolean
+  showStoch: boolean
+  showATR: boolean
+  showSignalLines: boolean
+  chartHeight?: number
+}) {
+  const wrapperRef = useRef<HTMLDivElement>(null)
+  const chartContainerRef = useRef<HTMLDivElement>(null)
+  const chartRef = useRef<any>(null)
+  const candleSeriesRef = useRef<any>(null)
+  const volumeSeriesRef = useRef<any>(null)
+  const volMaRef = useRef<any>(null)
+  const ema7Ref = useRef<any>(null)
+  const ema25Ref = useRef<any>(null)
+  const sma50Ref = useRef<any>(null)
+  const bbUpperRef = useRef<any>(null)
+  const bbMiddleRef = useRef<any>(null)
+  const bbLowerRef = useRef<any>(null)
+  const rsiChartRef = useRef<any>(null)
+  const rsiSeriesRef = useRef<any>(null)
+  const rsiObRef = useRef<any>(null)
+  const rsiOsRef = useRef<any>(null)
+  const macdChartRef = useRef<any>(null)
+  const macdLineRef = useRef<any>(null)
+  const macdSignalRef = useRef<any>(null)
+  const macdHistRef = useRef<any>(null)
+  const stochChartRef = useRef<any>(null)
+  const stochKRef = useRef<any>(null)
+  const stochDRef = useRef<any>(null)
+  const stochObRef = useRef<any>(null)
+  const stochOsRef = useRef<any>(null)
+  const atrChartRef = useRef<any>(null)
+  const atrSeriesRef = useRef<any>(null)
+
+  const [chartReady, setChartReady] = useState(false)
+  const signalLinesRef = useRef<any[]>([])
+  const drawingLinesRef = useRef<any[]>([])
+  const [isDrawing, setIsDrawing] = useState(false)
+  const [drawStart, setDrawStart] = useState<{x: number, y: number, time: number, price: number} | null>(null)
+
+  // Count how many sub-panels are shown
+  const subPanelCount = [showRSI, showMACD, showStoch, showATR].filter(Boolean).length
+  const mainChartHeight = chartHeight ?? 350
+
+  // Convert candle data for lightweight-charts
+  const chartData = useMemo(() => {
+    if (!candles || candles.length === 0) return { candleData: [], volumeData: [], closes: [] }
+    const candleData = candles.map(c => ({
+      time: Math.floor(new Date(c.time).getTime() / 1000) as unknown as string,
+      open: c.open, high: c.high, low: c.low, close: c.close,
+    }))
+    const volumeData = candles.map(c => ({
+      time: Math.floor(new Date(c.time).getTime() / 1000) as unknown as string,
+      value: c.volume,
+      color: c.close >= c.open ? 'rgba(0,255,127,0.25)' : 'rgba(255,59,48,0.25)',
+    }))
+    const closes = candles.map(c => c.close)
+    return { candleData, volumeData, closes }
+  }, [candles])
+
+  // Initialize chart
+  useEffect(() => {
+    if (!chartContainerRef.current) return
+    let mounted = true
+
+    const initChart = async () => {
+      const lc = await import('lightweight-charts')
+      if (!mounted || !chartContainerRef.current) return
+
+      if (chartRef.current) { chartRef.current.remove(); chartRef.current = null }
+
+      const chart = lc.createChart(chartContainerRef.current, {
+        layout: {
+          background: { color: T.bg },
+          textColor: T.textMuted,
+          fontFamily: 'monospace',
+          fontSize: 11,
+        },
+        grid: {
+          vertLines: { color: '#1E1E1E' },
+          horzLines: { color: '#1E1E1E' },
+        },
+        crosshair: {
+          mode: 0,
+          vertLine: { color: 'rgba(37,99,235,0.3)', width: 1, style: 2, labelBackgroundColor: T.accent },
+          horzLine: { color: 'rgba(37,99,235,0.3)', width: 1, style: 2, labelBackgroundColor: T.accent },
+        },
+        rightPriceScale: {
+          borderColor: T.border,
+          scaleMargins: { top: 0.05, bottom: 0.25 },
+        },
+        timeScale: {
+          borderColor: T.border,
+          timeVisible: true,
+          secondsVisible: false,
+          rightOffset: 5,
+          barSpacing: 8,
+        },
+        handleScroll: { vertTouchDrag: false },
+      })
+
+      chartRef.current = chart
+
+      const candleSeries = chart.addSeries(lc.CandlestickSeries, {
+        upColor: T.green, downColor: T.red,
+        borderUpColor: T.green, borderDownColor: T.red,
+        wickUpColor: T.green, wickDownColor: T.red,
+      })
+      candleSeriesRef.current = candleSeries
+
+      const volumeSeries = chart.addSeries(lc.HistogramSeries, {
+        priceFormat: { type: 'volume' },
+        priceScaleId: 'volume',
+      })
+      volumeSeries.priceScale().applyOptions({
+        scaleMargins: { top: 0.85, bottom: 0 },
+      })
+      volumeSeriesRef.current = volumeSeries
+
+      const volMa = chart.addSeries(lc.LineSeries, {
+        color: 'rgba(37,99,235,0.6)', lineWidth: 1, priceLineVisible: false,
+        lastValueVisible: false, crosshairMarkerVisible: false,
+        priceScaleId: 'volume',
+      })
+      volMaRef.current = volMa
+
+      const ema7 = chart.addSeries(lc.LineSeries, {
+        color: '#2563EB', lineWidth: 1, priceLineVisible: false,
+        lastValueVisible: false, crosshairMarkerVisible: false,
+      })
+      ema7Ref.current = ema7
+
+      const ema25 = chart.addSeries(lc.LineSeries, {
+        color: '#9333EA', lineWidth: 1, priceLineVisible: false,
+        lastValueVisible: false, crosshairMarkerVisible: false,
+      })
+      ema25Ref.current = ema25
+
+      const sma50 = chart.addSeries(lc.LineSeries, {
+        color: '#2563EB', lineWidth: 1, priceLineVisible: false,
+        lastValueVisible: false, crosshairMarkerVisible: false,
+      })
+      sma50Ref.current = sma50
+
+      const bbUpper = chart.addSeries(lc.LineSeries, {
+        color: 'rgba(0,255,127,0.5)', lineWidth: 1, priceLineVisible: false,
+        lastValueVisible: false, crosshairMarkerVisible: false, lineStyle: 2,
+      })
+      bbUpperRef.current = bbUpper
+
+      const bbMiddle = chart.addSeries(lc.LineSeries, {
+        color: 'rgba(37,99,235,0.4)', lineWidth: 1, priceLineVisible: false,
+        lastValueVisible: false, crosshairMarkerVisible: false,
+      })
+      bbMiddleRef.current = bbMiddle
+
+      const bbLower = chart.addSeries(lc.LineSeries, {
+        color: 'rgba(255,59,48,0.5)', lineWidth: 1, priceLineVisible: false,
+        lastValueVisible: false, crosshairMarkerVisible: false, lineStyle: 2,
+      })
+      bbLowerRef.current = bbLower
+
+      // RSI chart pane
+      const rsiContainer = wrapperRef.current?.querySelector('#rsi-pane') as HTMLElement
+      if (rsiContainer) {
+        const rsiChart = lc.createChart(rsiContainer, {
+          layout: { background: { color: T.bg }, textColor: T.textMuted, fontFamily: 'monospace', fontSize: 10 },
+          grid: { vertLines: { color: '#1E1E1E' }, horzLines: { color: '#1E1E1E' } },
+          rightPriceScale: { borderColor: T.border, scaleMargins: { top: 0.1, bottom: 0.1 } },
+          timeScale: { visible: false },
+          crosshair: {
+            mode: 0,
+            vertLine: { visible: false },
+            horzLine: { color: 'rgba(37,99,235,0.3)', labelBackgroundColor: T.accent },
+          },
+          handleScroll: false, handleScale: false,
+        })
+        rsiChartRef.current = rsiChart
+
+        const rsiSeries = rsiChart.addSeries(lc.LineSeries, {
+          color: '#9333EA', lineWidth: 1, priceLineVisible: false,
+          lastValueVisible: true, priceFormat: { type: 'price', precision: 1, minMove: 0.1 },
+        })
+        rsiSeriesRef.current = rsiSeries
+
+        const rsiOb = rsiChart.addSeries(lc.LineSeries, {
+          color: 'rgba(255,59,48,0.4)', lineWidth: 1, lineStyle: 2,
+          priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+        })
+        rsiObRef.current = rsiOb
+
+        const rsiOs = rsiChart.addSeries(lc.LineSeries, {
+          color: 'rgba(0,255,127,0.4)', lineWidth: 1, lineStyle: 2,
+          priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+        })
+        rsiOsRef.current = rsiOs
+      }
+
+      // MACD chart pane
+      const macdContainer = wrapperRef.current?.querySelector('#macd-pane') as HTMLElement
+      if (macdContainer) {
+        const macdChart = lc.createChart(macdContainer, {
+          layout: { background: { color: T.bg }, textColor: T.textMuted, fontFamily: 'monospace', fontSize: 10 },
+          grid: { vertLines: { color: '#1E1E1E' }, horzLines: { color: '#1E1E1E' } },
+          rightPriceScale: { borderColor: T.border, scaleMargins: { top: 0.1, bottom: 0.1 } },
+          timeScale: { visible: false },
+          crosshair: {
+            mode: 0,
+            vertLine: { visible: false },
+            horzLine: { color: 'rgba(37,99,235,0.3)', labelBackgroundColor: T.accent },
+          },
+          handleScroll: false, handleScale: false,
+        })
+        macdChartRef.current = macdChart
+
+        const macdLine = macdChart.addSeries(lc.LineSeries, {
+          color: '#2563EB', lineWidth: 1, priceLineVisible: false,
+          lastValueVisible: true, crosshairMarkerVisible: false,
+        })
+        macdLineRef.current = macdLine
+
+        const macdSignal = macdChart.addSeries(lc.LineSeries, {
+          color: '#F59E0B', lineWidth: 1, priceLineVisible: false,
+          lastValueVisible: false, crosshairMarkerVisible: false,
+        })
+        macdSignalRef.current = macdSignal
+
+        const macdHist = macdChart.addSeries(lc.HistogramSeries, {
+          priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+        })
+        macdHistRef.current = macdHist
+      }
+
+      // Stochastic chart pane
+      const stochContainer = wrapperRef.current?.querySelector('#stoch-pane') as HTMLElement
+      if (stochContainer) {
+        const stochChart = lc.createChart(stochContainer, {
+          layout: { background: { color: T.bg }, textColor: T.textMuted, fontFamily: 'monospace', fontSize: 10 },
+          grid: { vertLines: { color: '#1E1E1E' }, horzLines: { color: '#1E1E1E' } },
+          rightPriceScale: { borderColor: T.border, scaleMargins: { top: 0.05, bottom: 0.05 } },
+          timeScale: { visible: false },
+          crosshair: {
+            mode: 0,
+            vertLine: { visible: false },
+            horzLine: { color: 'rgba(37,99,235,0.3)', labelBackgroundColor: T.accent },
+          },
+          handleScroll: false, handleScale: false,
+        })
+        stochChartRef.current = stochChart
+
+        const stochK = stochChart.addSeries(lc.LineSeries, {
+          color: '#2563EB', lineWidth: 1, priceLineVisible: false,
+          lastValueVisible: true, priceFormat: { type: 'price', precision: 1, minMove: 0.1 },
+        })
+        stochKRef.current = stochK
+
+        const stochD = stochChart.addSeries(lc.LineSeries, {
+          color: '#ff9800', lineWidth: 1, priceLineVisible: false,
+          lastValueVisible: false, crosshairMarkerVisible: false,
+        })
+        stochDRef.current = stochD
+
+        const stochOb = stochChart.addSeries(lc.LineSeries, {
+          color: 'rgba(255,59,48,0.4)', lineWidth: 1, lineStyle: 2,
+          priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+        })
+        stochObRef.current = stochOb
+
+        const stochOs = stochChart.addSeries(lc.LineSeries, {
+          color: 'rgba(0,255,127,0.4)', lineWidth: 1, lineStyle: 2,
+          priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+        })
+        stochOsRef.current = stochOs
+      }
+
+      // ATR chart pane
+      const atrContainer = wrapperRef.current?.querySelector('#atr-pane') as HTMLElement
+      if (atrContainer) {
+        const atrChart = lc.createChart(atrContainer, {
+          layout: { background: { color: T.bg }, textColor: T.textMuted, fontFamily: 'monospace', fontSize: 10 },
+          grid: { vertLines: { color: '#1E1E1E' }, horzLines: { color: '#1E1E1E' } },
+          rightPriceScale: { borderColor: T.border, scaleMargins: { top: 0.1, bottom: 0.1 } },
+          timeScale: { visible: false },
+          crosshair: {
+            mode: 0,
+            vertLine: { visible: false },
+            horzLine: { color: 'rgba(37,99,235,0.3)', labelBackgroundColor: T.accent },
+          },
+          handleScroll: false, handleScale: false,
+        })
+        atrChartRef.current = atrChart
+
+        const atrSeries = atrChart.addSeries(lc.LineSeries, {
+          color: '#00bcd4', lineWidth: 1, priceLineVisible: false,
+          lastValueVisible: true, priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+        })
+        atrSeriesRef.current = atrSeries
+      }
+
+      // Handle click for drawing tools
+      chart.subscribeClick((param: any) => {
+        if (!activeDrawTool || !chartRef.current || !candleSeriesRef.current) return
+        const timeScale = chartRef.current.timeScale()
+        const priceScale = candleSeriesRef.current.priceScale()
+        if (!param.point || !param.time) return
+
+        const clickPrice = candleSeriesRef.current.coordinateToPrice(param.point.y)
+        const clickTime = param.time
+
+        if (!isDrawing) {
+          setIsDrawing(true)
+          setDrawStart({ x: param.point.x, y: param.point.y, time: clickTime as number, price: clickPrice as number })
+        } else {
+          if (drawStart && onDrawingsChange) {
+            const newDrawing: DrawingLine = {
+              id: Date.now().toString(),
+              type: activeDrawTool as any,
+              startX: drawStart.time, startY: drawStart.price,
+              endX: clickTime as number, endY: clickPrice as number,
+            }
+            onDrawingsChange([...(drawings || []), newDrawing])
+          }
+          setIsDrawing(false)
+          setDrawStart(null)
+        }
+      })
+
+      setChartReady(true)
+    }
+
+    initChart()
+
+    return () => {
+      mounted = false
+      if (chartRef.current) { try { chartRef.current.remove() } catch {} chartRef.current = null }
+      if (rsiChartRef.current) { try { rsiChartRef.current.remove() } catch {} rsiChartRef.current = null }
+      if (macdChartRef.current) { try { macdChartRef.current.remove() } catch {} macdChartRef.current = null }
+      if (stochChartRef.current) { try { stochChartRef.current.remove() } catch {} stochChartRef.current = null }
+      if (atrChartRef.current) { try { atrChartRef.current.remove() } catch {} atrChartRef.current = null }
+    }
+  }, [])
+
+  // Update signal lines (SL/TP/Entry) when positions change - ALWAYS visible
+  useEffect(() => {
+    if (!chartReady || !chartRef.current) return
+
+    const updateSignalLines = async () => {
+      const lc = await import('lightweight-charts')
+      if (!chartRef.current) return
+
+      signalLinesRef.current.forEach(line => {
+        try { chartRef.current?.removeSeries(line) } catch {}
+      })
+      signalLinesRef.current = []
+
+      // Filter positions for the currently selected pair
+      const pairPositions = (openPositions || []).filter(pos => {
+        const posSymbol = pos.symbol || pos.sessionSymbol || ''
+        return posSymbol === selectedPair.label || posSymbol === selectedPair.symbol
+      })
+
+      if (pairPositions.length === 0) return
+
+      const times = chartData.candleData.map(d => d.time)
+      if (times.length === 0) return
+
+      pairPositions.forEach(pos => {
+        const isBuy = pos.type === 'BUY'
+        const posLeverage = (pos as any).leverage || 1
+
+        // ENTRY PRICE LINE - thick solid line with colored background label
+        if (pos.entryPrice) {
+          try {
+            const entryLine = chartRef.current.addSeries(lc.LineSeries, {
+              color: isBuy ? '#00FF7F' : '#FF3B30',
+              lineWidth: 3, lineStyle: 0,
+              priceLineVisible: true, lastValueVisible: true,
+              priceFormat: { type: 'price', precision: selectedPair.decimals, minMove: 1 / Math.pow(10, selectedPair.decimals) },
+              title: `${isBuy ? 'BUY' : 'SELL'} Entry: ${fmtPrice(pos.entryPrice)}`,
+            })
+            entryLine.setData(times.map(t => ({ time: t, value: pos.entryPrice! })))
+            signalLinesRef.current.push(entryLine)
+          } catch {}
+        }
+
+        // STOP LOSS LINE - red solid thick with label
+        if (pos.stopLoss) {
+          try {
+            const slLine = chartRef.current.addSeries(lc.LineSeries, {
+              color: '#FF3B30', lineWidth: 3, lineStyle: 2,
+              priceLineVisible: true, lastValueVisible: true,
+              priceFormat: { type: 'price', precision: selectedPair.decimals, minMove: 1 / Math.pow(10, selectedPair.decimals) },
+              title: `SL: ${fmtPrice(pos.stopLoss)}`,
+            })
+            slLine.setData(times.map(t => ({ time: t, value: pos.stopLoss! })))
+            signalLinesRef.current.push(slLine)
+          } catch {}
+        }
+
+        // TAKE PROFIT LINE - green solid thick with label
+        if (pos.takeProfit) {
+          try {
+            const tpLine = chartRef.current.addSeries(lc.LineSeries, {
+              color: '#00FF7F', lineWidth: 3, lineStyle: 2,
+              priceLineVisible: true, lastValueVisible: true,
+              priceFormat: { type: 'price', precision: selectedPair.decimals, minMove: 1 / Math.pow(10, selectedPair.decimals) },
+              title: `TP: ${fmtPrice(pos.takeProfit)}`,
+            })
+            tpLine.setData(times.map(t => ({ time: t, value: pos.takeProfit! })))
+            signalLinesRef.current.push(tpLine)
+          } catch {}
+        }
+
+        // LIQUIDATION ZONE - faint fill between entry and SL
+        if (pos.entryPrice && pos.stopLoss) {
+          try {
+            const slZoneTop = chartRef.current.addSeries(lc.LineSeries, {
+              color: 'rgba(255,59,48,0.08)', lineWidth: 1, lineStyle: 0,
+              priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+            })
+            slZoneTop.setData(times.map(t => ({ time: t, value: pos.stopLoss! })))
+            signalLinesRef.current.push(slZoneTop)
+
+            const slZoneBottom = chartRef.current.addSeries(lc.LineSeries, {
+              color: 'rgba(255,59,48,0.08)', lineWidth: 1, lineStyle: 0,
+              priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+            })
+            slZoneBottom.setData(times.map(t => ({ time: t, value: pos.entryPrice! })))
+            signalLinesRef.current.push(slZoneBottom)
+          } catch {}
+        }
+
+        // PROFIT ZONE - faint fill between entry and TP
+        if (pos.entryPrice && pos.takeProfit) {
+          try {
+            const tpZoneTop = chartRef.current.addSeries(lc.LineSeries, {
+              color: 'rgba(0,255,127,0.08)', lineWidth: 1, lineStyle: 0,
+              priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+            })
+            tpZoneTop.setData(times.map(t => ({ time: t, value: pos.takeProfit! })))
+            signalLinesRef.current.push(tpZoneTop)
+
+            const tpZoneBottom = chartRef.current.addSeries(lc.LineSeries, {
+              color: 'rgba(0,255,127,0.08)', lineWidth: 1, lineStyle: 0,
+              priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+            })
+            tpZoneBottom.setData(times.map(t => ({ time: t, value: pos.entryPrice! })))
+            signalLinesRef.current.push(tpZoneBottom)
+          } catch {}
+        }
+      })
+    }
+
+    updateSignalLines()
+  }, [chartReady, openPositions, chartData.candleData, selectedPair])
+
+  // Update drawing lines when drawings change
+  useEffect(() => {
+    if (!chartReady || !chartRef.current) return
+
+    const updateDrawingLines = async () => {
+      const lc = await import('lightweight-charts')
+      if (!chartRef.current) return
+
+      drawingLinesRef.current.forEach(line => {
+        try { chartRef.current?.removeSeries(line) } catch {}
+      })
+      drawingLinesRef.current = []
+
+      if (!drawings || drawings.length === 0) return
+
+      drawings.forEach(draw => {
+        if (draw.type === 'horizontal') {
+          const times = chartData.candleData.map(d => d.time)
+          if (times.length === 0) return
+          try {
+            const hLine = chartRef.current.addSeries(lc.LineSeries, {
+              color: 'rgba(255,255,255,0.6)', lineWidth: 1, lineStyle: 1,
+              priceLineVisible: false, lastValueVisible: false,
+              crosshairMarkerVisible: false,
+            })
+            hLine.setData(times.map(t => ({ time: t, value: draw.startY })))
+            drawingLinesRef.current.push(hLine)
+          } catch {}
+        } else if (draw.type === 'trend') {
+          try {
+            const tLine = chartRef.current.addSeries(lc.LineSeries, {
+              color: 'rgba(245,158,11,0.7)', lineWidth: 1, lineStyle: 0,
+              priceLineVisible: false, lastValueVisible: false,
+              crosshairMarkerVisible: false,
+            })
+            const data = []
+            data.push({ time: draw.startX as unknown as string, value: draw.startY })
+            data.push({ time: draw.endX as unknown as string, value: draw.endY })
+            tLine.setData(data)
+            drawingLinesRef.current.push(tLine)
+          } catch {}
+        } else if (draw.type === 'rectangle') {
+          try {
+            const topLine = chartRef.current.addSeries(lc.LineSeries, {
+              color: 'rgba(147,51,234,0.5)', lineWidth: 1, lineStyle: 0,
+              priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+            })
+            const bottomLine = chartRef.current.addSeries(lc.LineSeries, {
+              color: 'rgba(147,51,234,0.5)', lineWidth: 1, lineStyle: 0,
+              priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+            })
+            const leftLine = chartRef.current.addSeries(lc.LineSeries, {
+              color: 'rgba(147,51,234,0.5)', lineWidth: 1, lineStyle: 0,
+              priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+            })
+            const rightLine = chartRef.current.addSeries(lc.LineSeries, {
+              color: 'rgba(147,51,234,0.5)', lineWidth: 1, lineStyle: 0,
+              priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+            })
+            const maxPrice = Math.max(draw.startY, draw.endY)
+            const minPrice = Math.min(draw.startY, draw.endY)
+            const minTime = Math.min(draw.startX, draw.endX)
+            const maxTime = Math.max(draw.startX, draw.endX)
+
+            topLine.setData([{ time: minTime as unknown as string, value: maxPrice }, { time: maxTime as unknown as string, value: maxPrice }])
+            bottomLine.setData([{ time: minTime as unknown as string, value: minPrice }, { time: maxTime as unknown as string, value: minPrice }])
+            leftLine.setData([{ time: minTime as unknown as string, value: minPrice }, { time: minTime as unknown as string, value: maxPrice }])
+            rightLine.setData([{ time: maxTime as unknown as string, value: minPrice }, { time: maxTime as unknown as string, value: maxPrice }])
+
+            drawingLinesRef.current.push(topLine, bottomLine, leftLine, rightLine)
+          } catch {}
+        }
+      })
+    }
+
+    updateDrawingLines()
+  }, [chartReady, drawings, chartData.candleData])
+
+  // Update data
+  useEffect(() => {
+    if (!chartReady || chartData.candleData.length === 0) return
+    try {
+      candleSeriesRef.current?.setData(chartData.candleData)
+      volumeSeriesRef.current?.setData(chartData.volumeData)
+
+      const closes = chartData.closes
+      const times = chartData.candleData.map(d => d.time)
+
+      const volumes = candles.map(c => c.volume)
+      const volMaData = calcSMA(volumes, 20)
+      volMaRef.current?.setData(volMaData.map((v, i) => v !== null ? { time: times[i], value: v } : null).filter(Boolean))
+
+      if (showEMA) {
+        const ema7Data = calcEMA(closes, 7)
+        const ema25Data = calcEMA(closes, 25)
+        const sma50Data = calcSMA(closes, 50)
+        ema7Ref.current?.setData(ema7Data.map((v, i) => v !== null ? { time: times[i], value: v } : null).filter(Boolean))
+        ema25Ref.current?.setData(ema25Data.map((v, i) => v !== null ? { time: times[i], value: v } : null).filter(Boolean))
+        sma50Ref.current?.setData(sma50Data.map((v, i) => v !== null ? { time: times[i], value: v } : null).filter(Boolean))
+      } else {
+        ema7Ref.current?.setData([]); ema25Ref.current?.setData([]); sma50Ref.current?.setData([])
+      }
+
+      if (showBB) {
+        const bb = calcBollingerBands(closes, 20, 2)
+        bbUpperRef.current?.setData(bb.upper.map((v, i) => v !== null ? { time: times[i], value: v } : null).filter(Boolean))
+        bbMiddleRef.current?.setData(bb.middle.map((v, i) => v !== null ? { time: times[i], value: v } : null).filter(Boolean))
+        bbLowerRef.current?.setData(bb.lower.map((v, i) => v !== null ? { time: times[i], value: v } : null).filter(Boolean))
+      } else {
+        bbUpperRef.current?.setData([]); bbMiddleRef.current?.setData([]); bbLowerRef.current?.setData([])
+      }
+
+      if (showRSI && rsiSeriesRef.current) {
+        const rsiData = calcRSI(closes, 14)
+        rsiSeriesRef.current?.setData(rsiData.map((v, i) => v !== null ? { time: times[i], value: v } : null).filter(Boolean))
+        const obData = times.map(t => ({ time: t, value: 70 }))
+        const osData = times.map(t => ({ time: t, value: 30 }))
+        rsiObRef.current?.setData(obData)
+        rsiOsRef.current?.setData(osData)
+      }
+
+      if (showMACD && macdLineRef.current) {
+        const macd = calcMACD(closes, 12, 26, 9)
+        macdLineRef.current?.setData(macd.macdLine.map((v, i) => v !== null ? { time: times[i], value: v } : null).filter(Boolean))
+        macdSignalRef.current?.setData(macd.signalLine.map((v, i) => v !== null ? { time: times[i], value: v } : null).filter(Boolean))
+        macdHistRef.current?.setData(macd.histogram.map((v, i) => {
+          if (v === null) return null
+          return { time: times[i], value: v, color: v >= 0 ? 'rgba(0,255,127,0.6)' : 'rgba(255,59,48,0.6)' }
+        }).filter(Boolean))
+      }
+
+      if (showStoch && stochKRef.current) {
+        const stoch = calcStochastic(candles, 14, 3, 3)
+        stochKRef.current?.setData(stoch.kLine.map((v, i) => v !== null ? { time: times[i], value: v } : null).filter(Boolean))
+        stochDRef.current?.setData(stoch.dLine.map((v, i) => v !== null ? { time: times[i], value: v } : null).filter(Boolean))
+        const obData = times.map(t => ({ time: t, value: 80 }))
+        const osData = times.map(t => ({ time: t, value: 20 }))
+        stochObRef.current?.setData(obData)
+        stochOsRef.current?.setData(osData)
+      }
+
+      if (showATR && atrSeriesRef.current) {
+        const atrData = calcATR(candles, 14)
+        atrSeriesRef.current?.setData(atrData.map((v, i) => v !== null ? { time: times[i], value: v } : null).filter(Boolean))
+      }
+
+      chartRef.current?.timeScale().fitContent()
+    } catch (e) {
+      // Chart might not be ready yet
+    }
+  }, [chartData, chartReady, showEMA, showBB, showRSI, showMACD, showStoch, showATR, candles])
+
+  // Resize
+  useEffect(() => {
+    if (!wrapperRef.current) return
+    const observer = new ResizeObserver(() => {
+      const w = wrapperRef.current?.clientWidth
+      if (w) {
+        chartRef.current?.applyOptions({ width: w })
+        rsiChartRef.current?.applyOptions({ width: w })
+        macdChartRef.current?.applyOptions({ width: w })
+        stochChartRef.current?.applyOptions({ width: w })
+        atrChartRef.current?.applyOptions({ width: w })
+      }
+    })
+    observer.observe(wrapperRef.current)
+    return () => observer.disconnect()
+  }, [])
+
+  // Drawing indicator
+  const DrawingIndicator = () => (
+    activeDrawTool ? (
+      <div style={{
+        position: 'absolute', top: 8, left: '50%', transform: 'translateX(-50%)',
+        background: `${T.accent}20`, border: `1px solid ${T.accentBorder}`,
+        borderRadius: 6, padding: '3px 10px', fontSize: 10, color: T.accent,
+        fontWeight: 600, fontFamily: "'Cairo', sans-serif", zIndex: 10,
+        pointerEvents: 'none',
+      }}>
+        {isAr ? 'اضغط نقطتين على الرسم' : 'Click 2 points on chart'}
+      </div>
+    ) : null
+  )
+
+  return (
+    <div ref={wrapperRef} style={{ direction: 'ltr', position: 'relative' }}>
+      <DrawingIndicator />
+
+      {/* Active Positions Overlay - shows on top of chart */}
+      {(() => {
+        const pairPositions = (openPositions || []).filter(pos => {
+          const posSymbol = pos.symbol || pos.sessionSymbol || ''
+          return posSymbol === selectedPair.label || posSymbol === selectedPair.symbol
+        })
+        if (pairPositions.length === 0) return null
+        return (
+          <div style={{
+            position: 'absolute', top: 8, right: 8, zIndex: 10,
+            display: 'flex', flexDirection: 'column', gap: 4, maxWidth: 200,
+            pointerEvents: 'none',
+          }}>
+            {pairPositions.map((pos, i) => {
+              const isBuy = pos.type === 'BUY'
+              const posLeverage = (pos as any).leverage || 1
+              return (
+                <div key={pos.id || i} style={{
+                  background: 'rgba(18,18,18,0.92)', backdropFilter: 'blur(8px)',
+                  border: `1px solid ${isBuy ? 'rgba(0,255,127,0.4)' : 'rgba(255,59,48,0.4)'}`,
+                  borderRadius: 6, padding: '5px 8px', fontSize: 9,
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2 }}>
+                    <span style={{
+                      width: 6, height: 6, borderRadius: '50%', background: isBuy ? T.green : T.red,
+                      boxShadow: `0 0 6px ${isBuy ? T.green : T.red}`, animation: 'pulse 2s infinite',
+                      display: 'inline-block', flexShrink: 0,
+                    }} />
+                    <span style={{
+                      color: isBuy ? T.green : T.red, fontWeight: 900, fontFamily: 'monospace', fontSize: 10,
+                      background: isBuy ? 'rgba(0,255,127,0.15)' : 'rgba(255,59,48,0.15)',
+                      padding: '0px 4px', borderRadius: 3,
+                    }}>
+                      {isBuy ? 'BUY' : 'SELL'}
+                    </span>
+                    <span style={{ color: T.textPrimary, fontWeight: 700, fontSize: 10, fontFamily: 'monospace' }}>
+                      {pos.amount.toFixed(0)}
+                    </span>
+                    {posLeverage > 1 && (
+                      <span style={{
+                        color: T.accent, fontWeight: 900, fontSize: 9, fontFamily: 'monospace',
+                        background: 'rgba(37,99,235,0.2)', padding: '0px 3px', borderRadius: 3, border: '1px solid rgba(37,99,235,0.4)',
+                      }}>
+                        ×{posLeverage}
+                      </span>
+                    )}
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 1, fontSize: 8, fontFamily: 'monospace' }}>
+                    <span style={{
+                      color: isBuy ? T.green : T.red,
+                      background: isBuy ? 'rgba(0,255,127,0.1)' : 'rgba(255,59,48,0.1)',
+                      padding: '0px 3px', borderRadius: 2, display: 'inline-block', width: 'fit-content',
+                    }}>
+                      {isBuy ? 'BUY' : 'SELL'} Entry: {fmtPrice(pos.entryPrice)}
+                    </span>
+                    {pos.stopLoss && (
+                      <span style={{
+                        color: T.red,
+                        background: 'rgba(255,59,48,0.1)', padding: '0px 3px', borderRadius: 2,
+                        display: 'inline-block', width: 'fit-content',
+                      }}>
+                        SL: {fmtPrice(pos.stopLoss)}
+                      </span>
+                    )}
+                    {pos.takeProfit && (
+                      <span style={{
+                        color: T.green,
+                        background: 'rgba(0,255,127,0.1)', padding: '0px 3px', borderRadius: 2,
+                        display: 'inline-block', width: 'fit-content',
+                      }}>
+                        TP: {fmtPrice(pos.takeProfit)}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        )
+      })()}
+
+      {/* Main chart container */}
+      <div ref={chartContainerRef} id="main-chart" style={{ width: '100%', height: mainChartHeight, minHeight: 200 }} />
+
+      {/* RSI pane */}
+      {showRSI && (
+        <div style={{ borderTop: `1px solid ${T.border}` }}>
+          <div style={{ fontSize: 9, color: T.purple, padding: '2px 8px', fontWeight: 700 }}>RSI (14)</div>
+          <div id="rsi-pane" style={{ width: '100%', height: 80 }} />
+        </div>
+      )}
+
+      {/* MACD pane */}
+      {showMACD && (
+        <div style={{ borderTop: `1px solid ${T.border}` }}>
+          <div style={{ fontSize: 9, color: T.blue, padding: '2px 8px', fontWeight: 700 }}>MACD (12,26,9)</div>
+          <div id="macd-pane" style={{ width: '100%', height: 80 }} />
+        </div>
+      )}
+
+      {/* Stochastic pane */}
+      {showStoch && (
+        <div style={{ borderTop: `1px solid ${T.border}` }}>
+          <div style={{ fontSize: 9, color: T.blue, padding: '2px 8px', fontWeight: 700, display: 'flex', gap: 10, alignItems: 'center' }}>
+            <span>Stoch (14,3,3)</span>
+            <span style={{ color: T.blue }}>● %K</span>
+            <span style={{ color: T.orange }}>● %D</span>
+          </div>
+          <div id="stoch-pane" style={{ width: '100%', height: 80 }} />
+        </div>
+      )}
+
+      {/* ATR pane */}
+      {showATR && (
+        <div style={{ borderTop: `1px solid ${T.border}` }}>
+          <div style={{ fontSize: 9, color: T.cyan, padding: '2px 8px', fontWeight: 700 }}>ATR (14)</div>
+          <div id="atr-pane" style={{ width: '100%', height: 80 }} />
+        </div>
+      )}
+
+      {/* Legend */}
+      <div style={{ display: 'flex', gap: 12, padding: '4px 8px', fontSize: 9, fontFamily: 'monospace', flexWrap: 'wrap' }}>
+        {showEMA && <>
+          <span style={{ color: T.accent }}>● EMA7</span>
+          <span style={{ color: T.purple }}>● EMA25</span>
+          <span style={{ color: T.blue }}>● SMA50</span>
+        </>}
+        {showBB && <span style={{ color: T.green }}>● BB(20,2)</span>}
+        <span style={{ color: 'rgba(37,99,235,0.6)' }}>● VolMA(20)</span>
+      </div>
+    </div>
+  )
+}
+
+// ===== ORDER SUCCESS OVERLAY =====
+const OrderSuccessOverlay = ({ success, isAr }: { success: { side: string; amount: number; price: number }; isAr: boolean }) => (
+  <motion.div
+    initial={{ opacity: 0, scale: 0.8 }}
+    animate={{ opacity: 1, scale: 1 }}
+    exit={{ opacity: 0, scale: 0.8 }}
+    style={{
+      position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+      background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+      zIndex: 1000, backdropFilter: 'blur(4px)',
+    }}
+  >
+    <motion.div
+      initial={{ y: 30, opacity: 0 }}
+      animate={{ y: 0, opacity: 1 }}
+      transition={{ delay: 0.1, duration: 0.3 }}
+      style={{
+        background: T.card, border: `1px solid ${success.side === 'BUY' ? T.greenBorder : T.redBorder}`,
+        borderRadius: 20, padding: 32, textAlign: 'center', maxWidth: 340, width: '90%',
+        boxShadow: `0 20px 60px ${success.side === 'BUY' ? 'rgba(0,255,127,0.2)' : 'rgba(255,59,48,0.2)'}`,
+      }}
+    >
+      <motion.div
+        initial={{ scale: 0 }}
+        animate={{ scale: 1 }}
+        transition={{ delay: 0.2, type: 'spring', stiffness: 200 }}
+        style={{
+          width: 60, height: 60, borderRadius: '50%',
+          background: success.side === 'BUY' ? T.greenBg : T.redBg,
+          border: `2px solid ${success.side === 'BUY' ? T.green : T.red}`,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          margin: '0 auto 16px', fontSize: 28, color: success.side === 'BUY' ? T.green : T.red,
+        }}
+      >
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke={success.side === 'BUY' ? T.green : T.red} strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M20 6L9 17l-5-5" />
+        </svg>
+      </motion.div>
+      <div style={{ fontSize: 18, fontWeight: 900, color: success.side === 'BUY' ? T.green : T.red, fontFamily: "'Cairo', sans-serif", marginBottom: 8 }}>
+        {success.side === 'BUY'
+          ? (isAr ? 'تم شراء بنجاح!' : 'Buy Order Executed!')
+          : (isAr ? 'تم بيع بنجاح!' : 'Sell Order Executed!')}
+      </div>
+      <div style={{ fontSize: 28, fontWeight: 900, color: T.textPrimary, fontFamily: 'monospace', marginBottom: 4 }}>
+        ${success.amount.toFixed(2)}
+      </div>
+      <div style={{ fontSize: 12, color: T.textMuted, fontFamily: 'monospace' }}>
+        @ {fmtPrice(success.price)}
+      </div>
+    </motion.div>
+  </motion.div>
+)
+
+// ===== SVG ICONS =====
+const ArrowLeftIcon = () => (
+  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M19 12H5M12 19l-7-7 7-7" />
+  </svg>
+)
+
+const ChevronDownIcon = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M6 9l6 6 6-6" />
+  </svg>
+)
+
+const ChartIcon = () => (
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M3 3v18h18" /><path d="M18 17V9" /><path d="M13 17V5" /><path d="M8 17v-3" />
+  </svg>
+)
+
+const TradeIcon = () => (
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M3 7l6-4 6 4" /><path d="M9 3v12" /><path d="M21 17l-6 4-6-4" /><path d="M15 21V9" />
+  </svg>
+)
+
+const PositionsIcon = () => (
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2" /><rect x="9" y="3" width="6" height="4" rx="2" /><path d="M9 14l2 2 4-4" />
+  </svg>
+)
+
+// ===== MAIN TRADING PAGE =====
+const TradingPage = ({ user, lang, onNavigate }: { user: any; lang: string; onNavigate?: (page: string) => void }) => {
+  const { t } = useI18n()
+  const isAr = lang === 'ar'
+  const { setDashboardPage } = useAppStore()
+
+  // State
+  const [chartData, setChartData] = useState<CandleData[]>([])
+  const [binanceTicker, setBinanceTicker] = useState<BinanceTicker | null>(null)
+  const [selectedPair, setSelectedPair] = useState(PAIRS[0])
+  const [timeframe, setTimeframe] = useState('1m')
+  const [toast, setToast] = useState<{ msg: string; type: 'ok' | 'err' | 'info' } | null>(null)
+  const [loadingChart, setLoadingChart] = useState(true)
+  const [pairDropdownOpen, setPairDropdownOpen] = useState(false)
+
+  // Order form state
+  const [orderType, setOrderType] = useState<'market' | 'limit'>('market')
+  const [orderSide, setOrderSide] = useState<'BUY' | 'SELL'>('BUY')
+  const [orderAmount, setOrderAmount] = useState('')
+  const [orderPrice, setOrderPrice] = useState('')
+  const [stopLoss, setStopLoss] = useState('')
+  const [takeProfit, setTakeProfit] = useState('')
+  const [orderPercent, setOrderPercent] = useState(0)
+  const [submitting, setSubmitting] = useState(false)
+  const [orderSuccess, setOrderSuccess] = useState<{ side: string; amount: number; price: number } | null>(null)
+
+  // Positions state
+  const [openPositions, setOpenPositions] = useState<PositionData[]>([])
+  const [closedPositions, setClosedPositions] = useState<PositionData[]>([])
+  const [positionTab, setPositionTab] = useState<'open' | 'closed' | 'package'>('open')
+  const [closingId, setClosingId] = useState<string | null>(null)
+  const [livePrices, setLivePrices] = useState<Record<string, number>>({})
+
+  // Order book
+  const [orderBook, setOrderBook] = useState<{ asks: OrderBookEntry[]; bids: OrderBookEntry[] }>({ asks: [], bids: [] })
+
+  // Mobile tab
+  const [mobileTab, setMobileTab] = useState<'chart' | 'trade' | 'positions'>('chart')
+
+  // Mobile trading panel states
+  const [leverage, setLeverage] = useState(1)
+  const [marginType, setMarginType] = useState<'cross' | 'isolated'>('cross')
+  const [tradeTab, setTradeTab] = useState<'buy' | 'sell'>('buy')
+  const [showMobilePositions, setShowMobilePositions] = useState(false)
+  const [showMobileOrderBook, setShowMobileOrderBook] = useState(false)
+  const [leverageFlash, setLeverageFlash] = useState(false)
+
+  // Investment profits state
+  const [investmentProfit, setInvestmentProfit] = useState<number>(0)
+  const [hasActivePackage, setHasActivePackage] = useState(false)
+  const [packageTrades, setPackageTrades] = useState<any[]>([])
+  const [packageInvestments, setPackageInvestments] = useState<any[]>([])
+
+  // Drawing tools state
+  const [drawings, setDrawings] = useState<DrawingLine[]>([])
+  const [activeDrawTool, setActiveDrawTool] = useState<string | null>(null)
+
+  // Indicator toggles (lifted up from SonaChart)
+  const [showRSI, setShowRSI] = useState(true)
+  const [showMACD, setShowMACD] = useState(true)
+  const [showBB, setShowBB] = useState(true)
+  const [showEMA, setShowEMA] = useState(true)
+  const [showStoch, setShowStoch] = useState(false)
+  const [showATR, setShowATR] = useState(false)
+  const [showSignalLines, setShowSignalLines] = useState(true)
+
+  // Floating toolbar state
+  const [showIndicatorPopup, setShowIndicatorPopup] = useState(false)
+  const [showDrawPopup, setShowDrawPopup] = useState(false)
+
+  // Compact trade bar SL/TP expand
+  const [showSlTp, setShowSlTp] = useState(false)
+
+  // Refs
+  const binanceIntervalRef = useRef<NodeJS.Timeout | null>(null)
+  const bookIntervalRef = useRef<NodeJS.Timeout | null>(null)
+  const posIntervalRef = useRef<NodeJS.Timeout | null>(null)
+  const tickerIntervalRef = useRef<NodeJS.Timeout | null>(null)
+  const pairDropdownRef = useRef<HTMLDivElement>(null)
+  const indicatorPopupRef = useRef<HTMLDivElement>(null)
+  const drawPopupRef = useRef<HTMLDivElement>(null)
+  const isInputFocusedRef = useRef(false)
+
+  const showToast = (msg: string, type: 'ok' | 'err' | 'info' = 'ok') => {
+    setToast({ msg, type })
+    setTimeout(() => setToast(null), 3500)
+  }
+
+  // Leverage change handler with flash indicator
+  const handleLeverageChange = (newLeverage: number) => {
+    setLeverage(newLeverage)
+    setLeverageFlash(true)
+    setTimeout(() => setLeverageFlash(false), 1500)
+  }
+
+  // Close popups on outside click
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (pairDropdownRef.current && !pairDropdownRef.current.contains(e.target as Node)) {
+        setPairDropdownOpen(false)
+      }
+      if (indicatorPopupRef.current && !indicatorPopupRef.current.contains(e.target as Node)) {
+        setShowIndicatorPopup(false)
+      }
+      if (drawPopupRef.current && !drawPopupRef.current.contains(e.target as Node)) {
+        setShowDrawPopup(false)
+      }
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [])
+
+  // ===== LOAD BINANCE DATA =====
+  const loadBinanceData = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/market/binance?symbol=${selectedPair.symbol}&interval=${timeframe}&limit=200`)
+      if (!res.ok) throw new Error()
+      const data = await res.json()
+      // Skip state updates while input is focused to prevent re-render focus loss
+      if (!isInputFocusedRef.current) {
+        if (data.candles?.length > 0) setChartData(data.candles)
+        if (data.ticker) {
+          setBinanceTicker(data.ticker)
+          setLivePrices(prev => ({ ...prev, [selectedPair.label]: data.ticker.price }))
+        }
+        setLoadingChart(false)
+      }
+    } catch {
+      setLoadingChart(false)
+    }
+  }, [selectedPair, timeframe])
+
+  // ===== LOAD POSITIONS =====
+  const loadPositions = useCallback(async () => {
+    // Skip while input is focused to prevent re-render focus loss
+    if (isInputFocusedRef.current) return
+    try {
+      const token = useAppStore.getState().getToken()
+      const res = await fetch('/api/trading/positions', {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      })
+      if (!res.ok) return
+      const data = await res.json()
+      setOpenPositions(data.openPositions || [])
+      setClosedPositions(data.closedPositions || [])
+    } catch {}
+  }, [])
+
+  // ===== LOAD ORDER BOOK =====
+  const loadOrderBook = useCallback(async () => {
+    // Skip while input is focused to prevent re-render focus loss
+    if (isInputFocusedRef.current) return
+    try {
+      const res = await fetch(`/api/market/binance?symbol=${selectedPair.symbol}&type=depth&depthLimit=15`)
+      if (!res.ok) throw new Error()
+      const data = await res.json()
+      if (data.asks?.length > 0 || data.bids?.length > 0) {
+        setOrderBook({ asks: data.asks.reverse(), bids: data.bids })
+      }
+    } catch {
+      const price = binanceTicker?.price || chartData[chartData.length - 1]?.close || 60000
+      const asks: OrderBookEntry[] = []
+      const bids: OrderBookEntry[] = []
+      let askTotal = 0, bidTotal = 0
+      for (let i = 0; i < 10; i++) {
+        const spread = price * 0.0002 * (i + 1)
+        askTotal += Math.random() * 2 + 0.1
+        asks.push({ price: price + spread, amount: Math.random() * 2 + 0.1, total: askTotal })
+        bidTotal += Math.random() * 2 + 0.1
+        bids.push({ price: price - spread, amount: Math.random() * 2 + 0.1, total: bidTotal })
+      }
+      setOrderBook({ asks: asks.reverse(), bids })
+    }
+  }, [selectedPair.symbol, binanceTicker?.price, chartData])
+
+  // ===== REFRESH LIVE PRICES FOR ALL PAIRS =====
+  const refreshAllPrices = useCallback(async () => {
+    try {
+      // Skip while input is focused to prevent re-render focus loss
+      if (isInputFocusedRef.current) return
+      const results = await Promise.allSettled(
+        PAIRS.map(async (p) => {
+          const res = await fetch(`/api/market/binance?symbol=${p.symbol}&interval=1m&limit=1`)
+          if (!res.ok) return null
+          const data = await res.json()
+          return { label: p.label, price: data.ticker?.price || 0 }
+        })
+      )
+      const newPrices: Record<string, number> = {}
+      results.forEach(r => {
+        if (r.status === 'fulfilled' && r.value) {
+          newPrices[r.value.label] = r.value.price
+        }
+      })
+      setLivePrices(prev => ({ ...prev, ...newPrices }))
+    } catch {}
+  }, [])
+
+  // ===== INITIAL LOAD =====
+  useEffect(() => {
+    const init = async () => {
+      await Promise.all([loadBinanceData(), loadPositions(), refreshAllPrices()])
+    }
+    init()
+  }, [])
+
+  // ===== INTERVALS =====
+  useEffect(() => {
+    binanceIntervalRef.current = setInterval(loadBinanceData, 5000)
+    return () => { if (binanceIntervalRef.current) clearInterval(binanceIntervalRef.current) }
+  }, [loadBinanceData])
+
+  useEffect(() => {
+    const init = async () => { await loadOrderBook() }
+    init()
+    bookIntervalRef.current = setInterval(loadOrderBook, 3000)
+    return () => { if (bookIntervalRef.current) clearInterval(bookIntervalRef.current) }
+  }, [loadOrderBook])
+
+  useEffect(() => {
+    posIntervalRef.current = setInterval(loadPositions, 5000)
+    return () => { if (posIntervalRef.current) clearInterval(posIntervalRef.current) }
+  }, [loadPositions])
+
+  useEffect(() => {
+    tickerIntervalRef.current = setInterval(refreshAllPrices, 10000)
+    return () => { if (tickerIntervalRef.current) clearInterval(tickerIntervalRef.current) }
+  }, [refreshAllPrices])
+
+  // Pause when tab not visible
+  useEffect(() => {
+    const handler = () => {
+      if (document.hidden) {
+        binanceIntervalRef.current && clearInterval(binanceIntervalRef.current)
+        bookIntervalRef.current && clearInterval(bookIntervalRef.current)
+        posIntervalRef.current && clearInterval(posIntervalRef.current)
+        tickerIntervalRef.current && clearInterval(tickerIntervalRef.current)
+      } else {
+        loadBinanceData()
+        loadOrderBook()
+        loadPositions()
+        binanceIntervalRef.current = setInterval(loadBinanceData, 5000)
+        bookIntervalRef.current = setInterval(loadOrderBook, 3000)
+        posIntervalRef.current = setInterval(loadPositions, 5000)
+        tickerIntervalRef.current = setInterval(refreshAllPrices, 10000)
+      }
+    }
+    document.addEventListener('visibilitychange', handler)
+    return () => document.removeEventListener('visibilitychange', handler)
+  }, [loadBinanceData, loadOrderBook, loadPositions, refreshAllPrices])
+
+  // ===== CURRENT PRICE =====
+  const currentPrice = binanceTicker?.price || chartData[chartData.length - 1]?.close || 0
+  const priceChange = binanceTicker?.change || (chartData.length > 1 ? ((chartData[chartData.length - 1]?.close - chartData[0]?.open) / chartData[0]?.open * 100) : 0)
+
+  // ===== USER BALANCE (real-time) =====
+  const [liveBalance, setLiveBalance] = useState<number>(user?.balance || 0)
+  const userBalance = liveBalance
+  const availableForTrade = userBalance
+
+  // Fetch real balance from API
+  const fetchRealBalance = useCallback(async () => {
+    // Skip while input is focused to prevent re-render focus loss
+    if (isInputFocusedRef.current) return
+    try {
+      const token = useAppStore.getState().getToken()
+      const res = await fetch('/api/auth/me', {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      })
+      if (res.ok) {
+        const data = await res.json()
+        if (data.user?.balance !== undefined) {
+          setLiveBalance(data.user.balance)
+        }
+      }
+    } catch {}
+  }, [])
+
+  // Refresh balance every 15 seconds
+  useEffect(() => {
+    fetchRealBalance()
+    const interval = setInterval(fetchRealBalance, 15000)
+    return () => clearInterval(interval)
+  }, [fetchRealBalance])
+
+  // ===== FETCH INVESTMENT DATA =====
+  const fetchInvestmentData = useCallback(async () => {
+    if (isInputFocusedRef.current) return
+    try {
+      const token = useAppStore.getState().getToken()
+      const res = await fetch('/api/investments', {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      })
+      if (res.ok) {
+        const data = await res.json()
+        const allInvestments = data.investments || []
+        const activeInvestments = allInvestments.filter((inv: any) => inv.status === 'ACTIVE')
+        setHasActivePackage(activeInvestments.length > 0)
+        const totalProfit = activeInvestments.reduce((sum: number, inv: any) => sum + (inv.totalProfit || 0), 0)
+        setInvestmentProfit(totalProfit)
+        setPackageInvestments(allInvestments)
+        
+        // Fetch BotTrade records for each investment
+        const allPackageTrades: any[] = []
+        for (const inv of allInvestments) {
+          try {
+            const sessionRes = await fetch(`/api/trading/session?investmentId=${inv.id}`, {
+              headers: token ? { Authorization: `Bearer ${token}` } : {},
+            })
+            if (sessionRes.ok) {
+              const sessionData = await sessionRes.json()
+              const trades = (sessionData.trades || []).map((t: any) => ({
+                ...t,
+                investmentId: inv.id,
+                packageName: inv.package?.name || inv.package?.nameEn || 'SONA',
+                investmentAmount: inv.amount,
+              }))
+              allPackageTrades.push(...trades)
+            }
+          } catch {}
+        }
+        setPackageTrades(allPackageTrades)
+      }
+    } catch {}
+  }, [])
+
+  useEffect(() => {
+    fetchInvestmentData()
+    const interval = setInterval(fetchInvestmentData, 30000)
+    return () => clearInterval(interval)
+  }, [fetchInvestmentData])
+
+  // ===== SET AMOUNT PERCENT =====
+  const setAmountPercent = (pct: number) => {
+    setOrderPercent(pct)
+    const amount = (availableForTrade * pct / 100).toFixed(2)
+    setOrderAmount(amount)
+  }
+
+  // ===== EXECUTE ORDER =====
+  const executeOrder = async () => {
+    if (!orderAmount || parseFloat(orderAmount) <= 0) {
+      showToast(isAr ? 'يرجى إدخال مبلغ صحيح' : 'Please enter a valid amount', 'err')
+      return
+    }
+    if (parseFloat(orderAmount) > availableForTrade) {
+      showToast(isAr ? `المبلغ يتجاوز الرصيد المتاح (${availableForTrade.toFixed(2)})` : `Amount exceeds available balance (${availableForTrade.toFixed(2)})`, 'err')
+      return
+    }
+    if (currentPrice <= 0) {
+      showToast(isAr ? 'سعر السوق غير متاح حالياً' : 'Market price unavailable', 'err')
+      return
+    }
+
+    const sl = stopLoss ? parseFloat(stopLoss) : undefined
+    const tp = takeProfit ? parseFloat(takeProfit) : undefined
+    if (sl) {
+      if (orderSide === 'BUY' && sl >= currentPrice) {
+        showToast(isAr ? 'وقف الخسارة يجب أن يكون أقل من السعر الحالي للشراء' : 'Stop Loss must be below current price for BUY', 'err')
+        return
+      }
+      if (orderSide === 'SELL' && sl <= currentPrice) {
+        showToast(isAr ? 'وقف الخسارة يجب أن يكون أعلى من السعر الحالي للبيع' : 'Stop Loss must be above current price for SELL', 'err')
+        return
+      }
+    }
+    if (tp) {
+      if (orderSide === 'BUY' && tp <= currentPrice) {
+        showToast(isAr ? 'هدف الربح يجب أن يكون أعلى من السعر الحالي للشراء' : 'Take Profit must be above current price for BUY', 'err')
+        return
+      }
+      if (orderSide === 'SELL' && tp >= currentPrice) {
+        showToast(isAr ? 'هدف الربح يجب أن يكون أقل من السعر الحالي للبيع' : 'Take Profit must be below current price for SELL', 'err')
+        return
+      }
+    }
+
+    setSubmitting(true)
+    try {
+      const token = useAppStore.getState().getToken()
+      const res = await fetch('/api/trading/positions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({
+          symbol: selectedPair.label,
+          type: orderSide,
+          amount: parseFloat(orderAmount),
+          stopLoss: sl,
+          takeProfit: tp,
+          leverage: leverage,
+          marginType: marginType,
+        }),
+      })
+
+      if (res.ok) {
+        const data = await res.json()
+        const amt = parseFloat(orderAmount)
+        setOrderSuccess({ side: orderSide, amount: amt, price: data.currentPrice || currentPrice })
+        setOrderAmount('')
+        setStopLoss('')
+        setTakeProfit('')
+        setOrderPercent(0)
+        setShowSlTp(false)
+        showToast(
+          isAr
+            ? `تم تنفيذ أمر ${orderSide === 'BUY' ? 'الشراء' : 'البيع'} بنجاح - ${amt.toFixed(2)} @ ${fmtPrice(data.currentPrice || currentPrice)}`
+            : `${orderSide === 'BUY' ? 'Buy' : 'Sell'} order executed - ${amt.toFixed(2)} @ ${fmtPrice(data.currentPrice || currentPrice)}`,
+          'ok'
+        )
+        // Immediately update balance from API response to avoid stale display
+        if (data.newBalance !== undefined) {
+          setLiveBalance(data.newBalance)
+        }
+        loadPositions()
+        useAppStore.getState().refreshUser()
+        setTimeout(() => setOrderSuccess(null), 2500)
+      } else {
+        const errData = await res.json().catch(() => ({}))
+        showToast(errData.error || (isAr ? 'فشل تنفيذ الأمر' : 'Order execution failed'), 'err')
+      }
+    } catch {
+      showToast(isAr ? 'حدث خطأ في الاتصال' : 'Connection error', 'err')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  // ===== CLOSE POSITION =====
+  const closePosition = async (positionId: string) => {
+    setClosingId(positionId)
+    try {
+      const token = useAppStore.getState().getToken()
+      const res = await fetch('/api/trading/positions/close', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ positionId }),
+      })
+      if (res.ok) {
+        const data = await res.json()
+        showToast(
+          data.profitLoss >= 0
+            ? (isAr ? `تم إغلاق الصفقة بربح ${data.profitLoss.toFixed(2)}` : `Position closed with profit ${data.profitLoss.toFixed(2)}`)
+            : (isAr ? `تم إغلاق الصفقة بخسارة ${Math.abs(data.profitLoss).toFixed(2)}` : `Position closed with loss ${Math.abs(data.profitLoss).toFixed(2)}`),
+          data.profitLoss >= 0 ? 'ok' : 'err'
+        )
+        // Immediately update balance from API response to avoid stale display
+        if (data.newBalance !== undefined) {
+          setLiveBalance(data.newBalance)
+        }
+        loadPositions()
+        useAppStore.getState().refreshUser()
+      } else {
+        const errData = await res.json().catch(() => ({}))
+        showToast(errData.error || (isAr ? 'فشل إغلاق الصفقة' : 'Failed to close position'), 'err')
+      }
+    } catch {
+      showToast(isAr ? 'خطأ في الاتصال' : 'Connection error', 'err')
+    } finally {
+      setClosingId(null)
+    }
+  }
+
+  // ===== CALCULATE P&L FOR OPEN POSITIONS =====
+  const calculatePnL = (pos: PositionData): { pnl: number; pnlPct: number } => {
+    const currentP = livePrices[pos.symbol] || currentPrice
+    if (!currentP || pos.entryPrice <= 0) return { pnl: 0, pnlPct: 0 }
+    const qty = pos.quantity || (pos.amount / pos.entryPrice)
+    let pnl = 0
+    if (pos.type === 'BUY') pnl = (currentP - pos.entryPrice) * qty
+    else pnl = (pos.entryPrice - currentP) * qty
+    const pnlPct = pos.amount > 0 ? (pnl / pos.amount) * 100 : 0
+    return { pnl, pnlPct }
+  }
+
+  // ===== TOTAL P&L =====
+  const totalPnl = useMemo(() => {
+    return openPositions.reduce((sum, pos) => sum + calculatePnL(pos).pnl, 0)
+  }, [openPositions, livePrices, currentPrice]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ===== NAVIGATE =====
+  const goBack = () => {
+    if (onNavigate) onNavigate('dashboard')
+    else setDashboardPage('dashboard')
+  }
+
+  // ===== INDICATORS LIST =====
+  const INDICATORS = [
+    { key: 'EMA', label: isAr ? 'متوسطات' : 'EMA/SMA', active: showEMA, color: T.accent, toggle: () => setShowEMA(!showEMA) },
+    { key: 'BB', label: isAr ? 'بولنجر' : 'Bollinger', active: showBB, color: T.green, toggle: () => setShowBB(!showBB) },
+    { key: 'RSI', label: 'RSI', active: showRSI, color: T.purple, toggle: () => setShowRSI(!showRSI) },
+    { key: 'MACD', label: 'MACD', active: showMACD, color: T.blue, toggle: () => setShowMACD(!showMACD) },
+    { key: 'Stoch', label: 'Stoch', active: showStoch, color: T.orange, toggle: () => setShowStoch(!showStoch) },
+    { key: 'ATR', label: 'ATR', active: showATR, color: T.cyan, toggle: () => setShowATR(!showATR) },
+  ]
+
+  // ===== DRAWING TOOLS LIST =====
+  const DRAW_TOOLS = [
+    { key: 'horizontal', label: isAr ? 'خط أفقي' : 'Horizontal', symbol: '\u2014', color: '#fff' },
+    { key: 'trend', label: isAr ? 'خط اتجاه' : 'Trend Line', symbol: '/', color: '#ff9800' },
+    { key: 'rectangle', label: isAr ? 'مستطيل' : 'Rectangle', symbol: '\u25A1', color: '#9333EA' },
+  ]
+
+  // ===== ORDER BOOK COMPONENT =====
+  const OrderBookPanel = ({ compact }: { compact?: boolean }) => {
+    const maxTotal = Math.max(
+      ...orderBook.asks.map(a => a.total),
+      ...orderBook.bids.map(b => b.total),
+      1
+    )
+    const displayCount = compact ? 5 : 10
+    return (
+      <div style={{ fontSize: 10, fontFamily: 'monospace' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', padding: '4px 8px', color: T.textMuted, fontSize: 9, fontWeight: 700 }}>
+          <span>{isAr ? 'السعر' : 'Price'}</span>
+          <span>{isAr ? 'الكمية' : 'Amount'}</span>
+          <span>{isAr ? 'الإجمالي' : 'Total'}</span>
+        </div>
+        {/* Asks (sell) */}
+        <div style={{ maxHeight: compact ? 100 : 150, overflow: 'hidden' }}>
+          {[...orderBook.asks].reverse().slice(0, displayCount).map((ask, i) => (
+            <div key={`a${i}`} style={{ position: 'relative', padding: '2px 8px', display: 'flex', justifyContent: 'space-between' }}>
+              <div style={{
+                position: 'absolute', right: 0, top: 0, bottom: 0,
+                width: `${(ask.total / maxTotal) * 100}%`,
+                background: 'rgba(255,59,48,0.06)', pointerEvents: 'none',
+              }} />
+              <span style={{ color: T.red, zIndex: 1 }}>{fmtPrice(ask.price)}</span>
+              <span style={{ color: T.textSecondary, zIndex: 1 }}>{ask.amount.toFixed(5)}</span>
+              <span style={{ color: T.textMuted, zIndex: 1 }}>{ask.total.toFixed(3)}</span>
+            </div>
+          ))}
+        </div>
+        {/* Spread */}
+        <div style={{ padding: compact ? '4px 8px' : '6px 8px', textAlign: 'center', borderTop: `1px solid ${T.border}`, borderBottom: `1px solid ${T.border}` }}>
+          <span style={{ fontSize: compact ? 13 : 14, fontWeight: 900, color: priceChange >= 0 ? T.green : T.red, fontFamily: 'monospace' }}>
+            {fmtPrice(currentPrice)}
+          </span>
+        </div>
+        {/* Bids (buy) */}
+        <div style={{ maxHeight: compact ? 100 : 150, overflow: 'hidden' }}>
+          {orderBook.bids.slice(0, displayCount).map((bid, i) => (
+            <div key={`b${i}`} style={{ position: 'relative', padding: '2px 8px', display: 'flex', justifyContent: 'space-between' }}>
+              <div style={{
+                position: 'absolute', right: 0, top: 0, bottom: 0,
+                width: `${(bid.total / maxTotal) * 100}%`,
+                background: 'rgba(0,255,127,0.06)', pointerEvents: 'none',
+              }} />
+              <span style={{ color: T.green, zIndex: 1 }}>{fmtPrice(bid.price)}</span>
+              <span style={{ color: T.textSecondary, zIndex: 1 }}>{bid.amount.toFixed(5)}</span>
+              <span style={{ color: T.textMuted, zIndex: 1 }}>{bid.total.toFixed(3)}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    )
+  }
+
+  // ===== FLOATING CHART TOOLBAR =====
+  const FloatingToolbar = () => (
+    <div style={{
+      position: 'absolute', top: 8, right: isAr ? undefined : 8, left: isAr ? 8 : undefined,
+      display: 'flex', gap: 4, zIndex: 20,
+    }}>
+      {/* Indicators button */}
+      <div ref={indicatorPopupRef} style={{ position: 'relative' }}>
+        <button
+          onClick={() => { setShowIndicatorPopup(!showIndicatorPopup); setShowDrawPopup(false) }}
+          style={{
+            width: 34, height: 34, borderRadius: 8,
+            background: showIndicatorPopup ? T.accentBg : 'rgba(30,30,30,0.9)',
+            border: `1px solid ${showIndicatorPopup ? T.accentBorder : T.border}`,
+            color: showIndicatorPopup ? T.accent : T.textSecondary,
+            cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+            fontSize: 16, backdropFilter: 'blur(8px)',
+          }}
+          title={isAr ? 'المؤشرات' : 'Indicators'}
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M18 20V10M12 20V4M6 20v-6" />
+          </svg>
+        </button>
+        {/* Indicator popup */}
+        <AnimatePresence>
+          {showIndicatorPopup && (
+            <motion.div
+              initial={{ opacity: 0, y: -4, scale: 0.95 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: -4, scale: 0.95 }}
+              transition={{ duration: 0.15 }}
+              style={{
+                position: 'absolute', top: '100%', right: isAr ? undefined : 0, left: isAr ? 0 : undefined,
+                marginTop: 4, background: T.card, border: `1px solid ${T.border}`,
+                borderRadius: 10, padding: 8, minWidth: 180,
+                boxShadow: '0 8px 32px rgba(0,0,0,0.5)', zIndex: 100,
+              }}
+            >
+              <div style={{ fontSize: 10, fontWeight: 700, color: T.textMuted, marginBottom: 6, fontFamily: "'Cairo', sans-serif" }}>
+                {isAr ? 'المؤشرات الفنية' : 'Technical Indicators'}
+              </div>
+              {INDICATORS.map(ind => (
+                <button key={ind.key} onClick={ind.toggle} style={{
+                  display: 'flex', alignItems: 'center', gap: 8, width: '100%',
+                  padding: '8px 10px', borderRadius: 6,
+                  background: ind.active ? `${ind.color}15` : 'transparent',
+                  border: `1px solid ${ind.active ? `${ind.color}30` : 'transparent'}`,
+                  color: ind.active ? ind.color : T.textSecondary,
+                  fontSize: 12, fontWeight: 600, cursor: 'pointer',
+                  fontFamily: "'Cairo', sans-serif", marginBottom: 2,
+                  transition: 'all 0.15s',
+                }}>
+                  <span style={{
+                    width: 8, height: 8, borderRadius: '50%',
+                    background: ind.active ? ind.color : T.border,
+                    transition: 'all 0.15s',
+                  }} />
+                  {ind.label}
+                  <span style={{ marginLeft: 'auto', fontSize: 10, color: T.textMuted }}>
+                    {ind.active ? (isAr ? 'تشغيل' : 'ON') : (isAr ? 'إيقاف' : 'OFF')}
+                  </span>
+                </button>
+              ))}
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+
+      {/* Draw button */}
+      <div ref={drawPopupRef} style={{ position: 'relative' }}>
+        <button
+          onClick={() => { setShowDrawPopup(!showDrawPopup); setShowIndicatorPopup(false) }}
+          style={{
+            width: 34, height: 34, borderRadius: 8,
+            background: activeDrawTool ? 'rgba(245,158,11,0.15)' : showDrawPopup ? T.accentBg : 'rgba(30,30,30,0.9)',
+            border: `1px solid ${activeDrawTool ? 'rgba(245,158,11,0.3)' : showDrawPopup ? T.accentBorder : T.border}`,
+            color: activeDrawTool ? T.orange : showDrawPopup ? T.accent : T.textSecondary,
+            cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+            fontSize: 16, backdropFilter: 'blur(8px)',
+          }}
+          title={isAr ? 'أدوات الرسم' : 'Drawing Tools'}
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M12 20h9M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z" />
+          </svg>
+        </button>
+        {/* Draw tools popup */}
+        <AnimatePresence>
+          {showDrawPopup && (
+            <motion.div
+              initial={{ opacity: 0, y: -4, scale: 0.95 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: -4, scale: 0.95 }}
+              transition={{ duration: 0.15 }}
+              style={{
+                position: 'absolute', top: '100%', right: isAr ? undefined : 0, left: isAr ? 0 : undefined,
+                marginTop: 4, background: T.card, border: `1px solid ${T.border}`,
+                borderRadius: 10, padding: 8, minWidth: 160,
+                boxShadow: '0 8px 32px rgba(0,0,0,0.5)', zIndex: 100,
+              }}
+            >
+              <div style={{ fontSize: 10, fontWeight: 700, color: T.textMuted, marginBottom: 6, fontFamily: "'Cairo', sans-serif" }}>
+                {isAr ? 'أدوات الرسم' : 'Drawing Tools'}
+              </div>
+              {DRAW_TOOLS.map(tool => (
+                <button key={tool.key} onClick={() => { setActiveDrawTool(tool.key); setShowDrawPopup(false) }} style={{
+                  display: 'flex', alignItems: 'center', gap: 8, width: '100%',
+                  padding: '8px 10px', borderRadius: 6,
+                  background: activeDrawTool === tool.key ? `${tool.color}20` : 'transparent',
+                  border: `1px solid ${activeDrawTool === tool.key ? `${tool.color}40` : 'transparent'}`,
+                  color: activeDrawTool === tool.key ? tool.color : T.textSecondary,
+                  fontSize: 12, fontWeight: 600, cursor: 'pointer',
+                  fontFamily: "'Cairo', sans-serif", marginBottom: 2,
+                  transition: 'all 0.15s',
+                }}>
+                  <span style={{ fontSize: 16, fontWeight: 900 }}>{tool.symbol}</span>
+                  {tool.label}
+                </button>
+              ))}
+              {/* Deactivate tool */}
+              {activeDrawTool && (
+                <button onClick={() => { setActiveDrawTool(null); setShowDrawPopup(false) }} style={{
+                  display: 'flex', alignItems: 'center', gap: 8, width: '100%',
+                  padding: '8px 10px', borderRadius: 6,
+                  background: T.redBg, border: `1px solid ${T.redBorder}`,
+                  color: T.red, fontSize: 12, fontWeight: 600, cursor: 'pointer',
+                  fontFamily: "'Cairo', sans-serif", marginBottom: 2,
+                }}>
+                  {isAr ? 'إلغاء الأداة' : 'Deselect Tool'}
+                </button>
+              )}
+              {/* Clear all drawings */}
+              {(drawings?.length || 0) > 0 && (
+                <button onClick={() => { setDrawings([]); setShowDrawPopup(false) }} style={{
+                  display: 'flex', alignItems: 'center', gap: 8, width: '100%',
+                  padding: '8px 10px', borderRadius: 6,
+                  background: T.redBg, border: `1px solid ${T.redBorder}`,
+                  color: T.red, fontSize: 12, fontWeight: 600, cursor: 'pointer',
+                  fontFamily: "'Cairo', sans-serif",
+                }}>
+{isAr ? 'مسح الكل' : 'Clear All'} ({drawings.length})
+                </button>
+              )}
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+
+      {/* Signal lines toggle */}
+      <button
+        onClick={() => setShowSignalLines(!showSignalLines)}
+        style={{
+          width: 34, height: 34, borderRadius: 8,
+          background: showSignalLines ? 'rgba(0,255,127,0.12)' : 'rgba(30,30,30,0.9)',
+          border: `1px solid ${showSignalLines ? T.greenBorder : T.border}`,
+          color: showSignalLines ? T.green : T.textSecondary,
+          cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+          fontSize: 16, backdropFilter: 'blur(8px)',
+        }}
+        title={isAr ? 'خطوط الإشارة (SL/TP)' : 'Signal Lines (SL/TP)'}
+      >
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={showSignalLines ? T.green : T.textSecondary} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M3 3v18h18" /><path d="M7 16l4-8 4 4 5-9" />
+        </svg>
+      </button>
+    </div>
+  )
+
+  // ===== COMPACT TRADE BAR (for Chart tab) =====
+  const CompactTradeBar = () => (
+    <div style={{
+      background: T.card, borderTop: `1px solid ${T.border}`,
+      padding: '8px 12px',
+    }}>
+      {/* BUY/SELL row */}
+      <div style={{ display: 'flex', gap: 6, marginBottom: 6 }}>
+        <motion.button whileTap={{ scale: 0.95 }} onClick={() => setOrderSide('BUY')} style={{
+          flex: 1, padding: '10px 0', minHeight: 42,
+          background: orderSide === 'BUY'
+            ? `linear-gradient(135deg, ${T.green}, #0aa06a)`
+            : T.greenBg,
+          border: `1px solid ${orderSide === 'BUY' ? T.green : T.greenBorder}`,
+          color: orderSide === 'BUY' ? '#fff' : T.green,
+          borderRadius: 8, fontSize: 14, fontWeight: 900, cursor: 'pointer',
+          fontFamily: "'Cairo', sans-serif",
+          boxShadow: orderSide === 'BUY' ? `0 2px 12px rgba(0,255,127,0.3)` : 'none',
+          transition: 'all 0.2s',
+        }}>
+          {isAr ? 'شراء' : 'BUY'}
+        </motion.button>
+        <motion.button whileTap={{ scale: 0.95 }} onClick={() => setOrderSide('SELL')} style={{
+          flex: 1, padding: '10px 0', minHeight: 42,
+          background: orderSide === 'SELL'
+            ? `linear-gradient(135deg, ${T.red}, #d43b4f)`
+            : T.redBg,
+          border: `1px solid ${orderSide === 'SELL' ? T.red : T.redBorder}`,
+          color: orderSide === 'SELL' ? '#fff' : T.red,
+          borderRadius: 8, fontSize: 14, fontWeight: 900, cursor: 'pointer',
+          fontFamily: "'Cairo', sans-serif",
+          boxShadow: orderSide === 'SELL' ? `0 2px 12px rgba(255,59,48,0.3)` : 'none',
+          transition: 'all 0.2s',
+        }}>
+          {isAr ? 'بيع' : 'SELL'}
+        </motion.button>
+      </div>
+
+      {/* Amount input row */}
+      <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: 6 }}>
+        <div style={{ flex: 1, display: 'flex', alignItems: 'center', background: T.input, border: `1px solid ${T.border}`, borderRadius: 6, overflow: 'hidden' }}>
+          <input type="number" value={orderAmount} onChange={e => { setOrderAmount(e.target.value); setOrderPercent(0) }} onFocus={() => { isInputFocusedRef.current = true }} onBlur={() => { isInputFocusedRef.current = false }} placeholder={isAr ? 'المبلغ' : 'Amount'} style={{
+            flex: 1, background: 'transparent', border: 'none', color: T.textPrimary, padding: '8px 10px',
+            fontSize: 13, fontFamily: 'monospace', fontWeight: 700, outline: 'none', minWidth: 0,
+          }} dir="ltr" />
+          <span style={{ padding: '0 8px', color: T.textMuted, fontSize: 10, fontWeight: 600 }}>USDT</span>
+        </div>
+        <motion.button
+          whileTap={{ scale: 0.95 }}
+          onClick={executeOrder}
+          disabled={submitting}
+          style={{
+            padding: '8px 16px', minHeight: 38,
+            background: orderSide === 'BUY'
+              ? `linear-gradient(135deg, ${T.green}, #0aa06a)`
+              : `linear-gradient(135deg, ${T.red}, #d43b4f)`,
+            border: 'none', color: '#fff', borderRadius: 6, fontSize: 12, fontWeight: 900,
+            cursor: submitting ? 'not-allowed' : 'pointer', fontFamily: "'Cairo', sans-serif",
+            opacity: submitting ? 0.6 : 1, minWidth: 70,
+            transition: 'all 0.2s',
+          }}
+        >
+          {submitting ? '...' : (isAr ? 'تنفيذ' : 'GO')}
+        </motion.button>
+      </div>
+
+      {/* SL/TP expand toggle */}
+      <button onClick={() => setShowSlTp(!showSlTp)} style={{
+        background: 'transparent', border: 'none', color: T.textMuted, fontSize: 10,
+        fontWeight: 600, cursor: 'pointer', fontFamily: "'Cairo', sans-serif",
+        display: 'flex', alignItems: 'center', gap: 4, padding: 0,
+        marginBottom: showSlTp ? 6 : 0,
+      }}>
+        <span style={{ transform: showSlTp ? 'rotate(90deg)' : 'rotate(0deg)', transition: 'transform 0.2s', display: 'inline-block' }}>▶</span>
+        {isAr ? 'وقف خسارة / هدف ربح' : 'Stop Loss / Take Profit'}
+      </button>
+
+      {/* SL/TP inputs */}
+      <AnimatePresence>
+        {showSlTp && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.2 }}
+            style={{ overflow: 'hidden' }}
+          >
+            <div style={{ display: 'flex', gap: 6, paddingTop: 4 }}>
+              <div style={{ flex: 1, display: 'flex', alignItems: 'center', background: T.input, border: `1px solid ${T.redBorder}`, borderRadius: 6, overflow: 'hidden' }}>
+                <span style={{ padding: '0 6px', color: T.red, fontSize: 9, fontWeight: 700 }}>SL</span>
+                <input type="number" value={stopLoss} onChange={e => setStopLoss(e.target.value)} onFocus={() => { isInputFocusedRef.current = true }} onBlur={() => { isInputFocusedRef.current = false }} placeholder={fmtPrice(currentPrice * 0.98)} style={{
+                  flex: 1, background: 'transparent', border: 'none', color: T.red, padding: '6px 4px',
+                  fontSize: 11, fontFamily: 'monospace', fontWeight: 700, outline: 'none', minWidth: 0,
+                }} dir="ltr" />
+              </div>
+              <div style={{ flex: 1, display: 'flex', alignItems: 'center', background: T.input, border: `1px solid ${T.greenBorder}`, borderRadius: 6, overflow: 'hidden' }}>
+                <span style={{ padding: '0 6px', color: T.green, fontSize: 9, fontWeight: 700 }}>TP</span>
+                <input type="number" value={takeProfit} onChange={e => setTakeProfit(e.target.value)} onFocus={() => { isInputFocusedRef.current = true }} onBlur={() => { isInputFocusedRef.current = false }} placeholder={fmtPrice(currentPrice * 1.02)} style={{
+                  flex: 1, background: 'transparent', border: 'none', color: T.green, padding: '6px 4px',
+                  fontSize: 11, fontFamily: 'monospace', fontWeight: 700, outline: 'none', minWidth: 0,
+                }} dir="ltr" />
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  )
+
+  // ===== FULL TRADING PANEL (for Trade tab & desktop) =====
+  const TradingPanel = () => (
+    <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 12, overflow: 'hidden' }}>
+      {/* Balance Display */}
+      <div style={{ padding: '10px 12px', background: T.bg2, borderBottom: `1px solid ${T.border}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <span style={{ fontSize: 11, color: T.textMuted, fontWeight: 600, fontFamily: "'Cairo', sans-serif" }}>
+          {isAr ? 'الرصيد المتاح' : 'Available Balance'}
+        </span>
+        <span style={{ fontSize: 14, color: T.accent, fontWeight: 900, fontFamily: 'monospace' }}>
+          {fmt(availableForTrade)}
+        </span>
+      </div>
+
+      {/* Order Type Tabs */}
+      <div style={{ display: 'flex', gap: 4, padding: '12px 12px 0' }}>
+        <button onClick={() => setOrderType('market')} style={{
+          flex: 1, padding: '8px 0', background: orderType === 'market' ? T.accentBg : 'transparent',
+          border: `1px solid ${orderType === 'market' ? T.accentBorder : T.border}`,
+          color: orderType === 'market' ? T.accent : T.textMuted,
+          borderRadius: 6, fontSize: 12, fontWeight: 700, cursor: 'pointer', fontFamily: "'Cairo', sans-serif",
+        }}>
+          {isAr ? 'سوقي' : 'Market'}
+        </button>
+        <button onClick={() => setOrderType('limit')} style={{
+          flex: 1, padding: '8px 0', background: orderType === 'limit' ? T.accentBg : 'transparent',
+          border: `1px solid ${orderType === 'limit' ? T.accentBorder : T.border}`,
+          color: orderType === 'limit' ? T.accent : T.textMuted,
+          borderRadius: 6, fontSize: 12, fontWeight: 700, cursor: 'pointer', fontFamily: "'Cairo', sans-serif",
+        }}>
+          {isAr ? 'محدد' : 'Limit'}
+        </button>
+      </div>
+
+      <div style={{ padding: '12px' }}>
+        {/* Side Selector */}
+        <div style={{ display: 'flex', gap: 6, marginBottom: 12 }}>
+          <motion.button whileTap={{ scale: 0.95 }} onClick={() => setOrderSide('BUY')} style={{
+            flex: 1, padding: '14px 0', minHeight: 48, background: orderSide === 'BUY'
+              ? `linear-gradient(135deg, ${T.green}, #0aa06a)`
+              : T.greenBg,
+            border: `1px solid ${orderSide === 'BUY' ? T.green : T.greenBorder}`,
+            color: orderSide === 'BUY' ? '#fff' : T.green,
+            borderRadius: 10, fontSize: 16, fontWeight: 900, cursor: 'pointer', fontFamily: "'Cairo', sans-serif",
+            boxShadow: orderSide === 'BUY' ? `0 4px 20px rgba(0,255,127,0.3)` : 'none',
+            transition: 'all 0.2s',
+          }}>
+{isAr ? 'شراء' : 'BUY'}
+          </motion.button>
+          <motion.button whileTap={{ scale: 0.95 }} onClick={() => setOrderSide('SELL')} style={{
+            flex: 1, padding: '14px 0', minHeight: 48, background: orderSide === 'SELL'
+              ? `linear-gradient(135deg, ${T.red}, #d43b4f)`
+              : T.redBg,
+            border: `1px solid ${orderSide === 'SELL' ? T.red : T.redBorder}`,
+            color: orderSide === 'SELL' ? '#fff' : T.red,
+            borderRadius: 10, fontSize: 16, fontWeight: 900, cursor: 'pointer', fontFamily: "'Cairo', sans-serif",
+            boxShadow: orderSide === 'SELL' ? `0 4px 20px rgba(255,59,48,0.3)` : 'none',
+            transition: 'all 0.2s',
+          }}>
+{isAr ? 'بيع' : 'SELL'}
+          </motion.button>
+        </div>
+
+        {/* Price Display */}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10, padding: '8px 10px', background: T.bg, borderRadius: 8 }}>
+          <span style={{ fontSize: 10, color: T.textMuted, fontWeight: 600 }}>{selectedPair.label}</span>
+          <span style={{ fontSize: 16, fontWeight: 900, color: priceChange >= 0 ? T.green : T.red, fontFamily: 'monospace' }}>
+            {fmtPrice(currentPrice)}
+          </span>
+        </div>
+
+        {/* Limit Price */}
+        {orderType === 'limit' && (
+          <div style={{ marginBottom: 10 }}>
+            <div style={{ fontSize: 11, color: T.textMuted, marginBottom: 4, fontWeight: 600 }}>{isAr ? 'سعر الأمر' : 'Order Price'}</div>
+            <div style={{ display: 'flex', alignItems: 'center', background: T.input, border: `1px solid ${T.border}`, borderRadius: 8, overflow: 'hidden' }}>
+              <input type="number" value={orderPrice} onChange={e => setOrderPrice(e.target.value)} onFocus={() => { isInputFocusedRef.current = true }} onBlur={() => { isInputFocusedRef.current = false }} placeholder={fmtPrice(currentPrice)} style={{
+                flex: 1, background: 'transparent', border: 'none', color: T.textPrimary, padding: '10px 12px',
+                fontSize: 14, fontFamily: 'monospace', fontWeight: 700, outline: 'none', minWidth: 0,
+              }} dir="ltr" />
+              <span style={{ padding: '0 12px', color: T.textMuted, fontSize: 12, fontWeight: 600 }}>USDT</span>
+            </div>
+          </div>
+        )}
+
+        {/* Amount */}
+        <div style={{ marginBottom: 10 }}>
+          <div style={{ fontSize: 11, color: T.textMuted, marginBottom: 4, fontWeight: 600 }}>{isAr ? 'المبلغ (USDT)' : 'Amount (USDT)'}</div>
+          <div style={{ display: 'flex', alignItems: 'center', background: T.input, border: `1px solid ${T.border}`, borderRadius: 8, overflow: 'hidden' }}>
+            <input type="number" value={orderAmount} onChange={e => { setOrderAmount(e.target.value); setOrderPercent(0) }} onFocus={() => { isInputFocusedRef.current = true }} onBlur={() => { isInputFocusedRef.current = false }} placeholder="0.00" style={{
+              flex: 1, background: 'transparent', border: 'none', color: T.textPrimary, padding: '10px 12px',
+              fontSize: 14, fontFamily: 'monospace', fontWeight: 700, outline: 'none', minWidth: 0,
+            }} dir="ltr" />
+            <span style={{ padding: '0 12px', color: T.textMuted, fontSize: 12, fontWeight: 600 }}>USDT</span>
+          </div>
+          <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
+            {[25, 50, 75, 100].map(pct => (
+              <button key={pct} onClick={() => setAmountPercent(pct)} style={{
+                flex: 1, padding: '10px 0', background: orderPercent === pct ? T.accentBg : 'transparent',
+                border: `1px solid ${orderPercent === pct ? T.accentBorder : T.border}`,
+                color: orderPercent === pct ? T.accent : T.textMuted,
+                borderRadius: 6, fontSize: 12, fontWeight: 700, cursor: 'pointer', fontFamily: "'Cairo', sans-serif",
+                minHeight: 38, transition: 'all 0.2s',
+              }}>
+                {pct}%
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Stop Loss */}
+        <div style={{ marginBottom: 10 }}>
+          <div style={{ fontSize: 11, color: T.red, marginBottom: 4, fontWeight: 700, display: 'flex', alignItems: 'center', gap: 4 }}>
+            <span style={{ width: 8, height: 8, borderRadius: '50%', background: T.red, display: 'inline-block' }} />
+            {isAr ? 'وقف خسارة (اختياري)' : 'Stop Loss (optional)'}
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', background: T.input, border: `1px solid ${T.redBorder}`, borderRadius: 8, overflow: 'hidden' }}>
+            <input type="number" value={stopLoss} onChange={e => setStopLoss(e.target.value)} onFocus={() => { isInputFocusedRef.current = true }} onBlur={() => { isInputFocusedRef.current = false }} placeholder={isAr ? 'سعر وقف الخسارة' : 'Stop Loss price'} style={{
+              flex: 1, background: 'transparent', border: 'none', color: T.red, padding: '10px 12px',
+              fontSize: 14, fontFamily: 'monospace', fontWeight: 700, outline: 'none', minWidth: 0,
+            }} dir="ltr" />
+            <span style={{ padding: '0 12px', color: T.textMuted, fontSize: 12, fontWeight: 600 }}>USDT</span>
+          </div>
+        </div>
+
+        {/* Take Profit */}
+        <div style={{ marginBottom: 10 }}>
+          <div style={{ fontSize: 11, color: T.green, marginBottom: 4, fontWeight: 700, display: 'flex', alignItems: 'center', gap: 4 }}>
+            <span style={{ width: 8, height: 8, borderRadius: '50%', background: T.green, display: 'inline-block' }} />
+            {isAr ? 'هدف ربح (اختياري)' : 'Take Profit (optional)'}
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', background: T.input, border: `1px solid ${T.greenBorder}`, borderRadius: 8, overflow: 'hidden' }}>
+            <input type="number" value={takeProfit} onChange={e => setTakeProfit(e.target.value)} onFocus={() => { isInputFocusedRef.current = true }} onBlur={() => { isInputFocusedRef.current = false }} placeholder={isAr ? 'سعر هدف الربح' : 'Take Profit price'} style={{
+              flex: 1, background: 'transparent', border: 'none', color: T.green, padding: '10px 12px',
+              fontSize: 14, fontFamily: 'monospace', fontWeight: 700, outline: 'none', minWidth: 0,
+            }} dir="ltr" />
+            <span style={{ padding: '0 12px', color: T.textMuted, fontSize: 12, fontWeight: 600 }}>USDT</span>
+          </div>
+        </div>
+
+        {/* Execute Button */}
+        <motion.button
+          whileTap={{ scale: 0.97 }}
+          onClick={executeOrder}
+          disabled={submitting}
+          style={{
+            width: '100%', padding: '16px 0',
+            background: orderSide === 'BUY'
+              ? `linear-gradient(135deg, ${T.green}, #0aa06a)`
+              : `linear-gradient(135deg, ${T.red}, #d43b4f)`,
+            border: 'none', color: '#fff', borderRadius: 12, fontSize: 17, fontWeight: 900,
+            cursor: submitting ? 'not-allowed' : 'pointer', fontFamily: "'Cairo', sans-serif",
+            opacity: submitting ? 0.6 : 1,
+            boxShadow: `0 6px 24px ${orderSide === 'BUY' ? 'rgba(0,255,127,0.4)' : 'rgba(255,59,48,0.4)'}`,
+            minHeight: 52, transition: 'all 0.2s',
+          }}
+        >
+          {submitting ? (
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ width: 16, height: 16, border: '2px solid rgba(255,255,255,0.3)', borderTopColor: '#fff', borderRadius: '50%', animation: 'spin 0.8s linear infinite', display: 'inline-block' }} />
+              {isAr ? 'جارٍ التنفيذ...' : 'Executing...'}
+            </span>
+          ) : (
+            `${orderSide === 'BUY' ? (isAr ? 'شراء' : 'BUY') : (isAr ? 'بيع' : 'SELL')} ${selectedPair.label}`
+          )}
+        </motion.button>
+      </div>
+    </div>
+  )
+
+  // ===== POSITIONS PANEL =====
+  const PositionsPanel = ({ showSummary }: { showSummary?: boolean }) => (
+    <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 12, overflow: 'hidden' }}>
+      {/* Summary */}
+      {showSummary && openPositions.length > 0 && (
+        <div style={{
+          padding: '10px 14px', background: totalPnl >= 0 ? T.greenBg : T.redBg,
+          borderBottom: `1px solid ${totalPnl >= 0 ? T.greenBorder : T.redBorder}`,
+          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+        }}>
+          <span style={{ fontSize: 12, color: T.textSecondary, fontWeight: 600, fontFamily: "'Cairo', sans-serif" }}>
+            {isAr ? `إجمالي ${openPositions.length} صفقات` : `Total ${openPositions.length} positions`}
+          </span>
+          <span style={{
+            fontSize: 16, fontWeight: 900, fontFamily: 'monospace',
+            color: totalPnl >= 0 ? T.green : T.red,
+          }}>
+            {totalPnl >= 0 ? '+' : ''}{totalPnl.toFixed(2)}
+          </span>
+        </div>
+      )}
+
+      {/* Tabs */}
+      <div style={{ display: 'flex', borderBottom: `1px solid ${T.border}` }}>
+        <button onClick={() => setPositionTab('open')} style={{
+          flex: 1, padding: '12px 0', background: positionTab === 'open' ? T.accentBg : 'transparent',
+          border: 'none', borderBottom: positionTab === 'open' ? `2px solid ${T.accent}` : '2px solid transparent',
+          color: positionTab === 'open' ? T.accent : T.textMuted,
+          fontSize: 13, fontWeight: 700, cursor: 'pointer', fontFamily: "'Cairo', sans-serif",
+        }}>
+          {isAr ? 'صفقات مفتوحة' : 'Open Positions'} {openPositions.length > 0 && `(${openPositions.length})`}
+        </button>
+        <button onClick={() => setPositionTab('closed')} style={{
+          flex: 1, padding: '12px 0', background: positionTab === 'closed' ? T.accentBg : 'transparent',
+          border: 'none', borderBottom: positionTab === 'closed' ? `2px solid ${T.accent}` : '2px solid transparent',
+          color: positionTab === 'closed' ? T.accent : T.textMuted,
+          fontSize: 13, fontWeight: 700, cursor: 'pointer', fontFamily: "'Cairo', sans-serif",
+        }}>
+          {isAr ? 'السجل' : 'Closed History'} {closedPositions.length > 0 && `(${closedPositions.length})`}
+        </button>
+        <button onClick={() => setPositionTab('package')} style={{
+          flex: 1, padding: '12px 0', background: positionTab === 'package' ? T.accentBg : 'transparent',
+          border: 'none', borderBottom: positionTab === 'package' ? `2px solid ${T.accent}` : '2px solid transparent',
+          color: positionTab === 'package' ? T.accent : T.textMuted,
+          fontSize: 13, fontWeight: 700, cursor: 'pointer', fontFamily: "'Cairo', sans-serif",
+        }}>
+          {isAr ? 'الباقة' : 'Package'} {packageTrades.length > 0 && `(${packageTrades.length})`}
+        </button>
+      </div>
+
+      <div style={{ maxHeight: 400, overflowY: 'auto' }}>
+        <AnimatePresence mode="wait">
+          {positionTab === 'open' ? (
+            <motion.div key="open" initial={{ opacity: 0, x: -10 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 10 }} transition={{ duration: 0.2 }}>
+              {openPositions.length === 0 ? (
+                <div style={{ padding: 32, textAlign: 'center', color: T.textMuted, fontSize: 13 }}>
+                  {isAr ? 'لا توجد صفقات مفتوحة' : 'No open positions'}
+                </div>
+              ) : (
+                openPositions.map(pos => {
+                  const { pnl, pnlPct } = calculatePnL(pos)
+                  const isProfit = pnl >= 0
+                  const currentP = livePrices[pos.symbol] || currentPrice
+                  return (
+                    <div key={pos.id} style={{
+                      padding: '14px 16px', borderBottom: `1px solid ${T.border}`,
+                      background: isProfit ? 'rgba(0,255,127,0.03)' : 'rgba(255,59,48,0.03)',
+                      borderLeft: `3px solid ${isProfit ? T.green : T.red}`,
+                    }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                          <span style={{
+                            width: 8, height: 8, borderRadius: '50%', background: isProfit ? T.green : T.red,
+                            boxShadow: `0 0 8px ${isProfit ? T.green : T.red}`,
+                            animation: 'pulse 2s infinite', display: 'inline-block',
+                          }} />
+                          <span style={{
+                            padding: '3px 10px', borderRadius: 6, fontSize: 11, fontWeight: 900,
+                            background: pos.type === 'BUY' ? T.greenBg : T.redBg,
+                            color: pos.type === 'BUY' ? T.green : T.red,
+                            border: `1px solid ${pos.type === 'BUY' ? T.greenBorder : T.redBorder}`,
+                          }}>
+                            {pos.type === 'BUY' ? (isAr ? 'شراء' : 'BUY') : (isAr ? 'بيع' : 'SELL')}
+                          </span>
+                          <span style={{ fontSize: 14, fontWeight: 700, color: T.textPrimary }}>{pos.symbol}</span>
+                        </div>
+                        <div style={{
+                          padding: '4px 10px', borderRadius: 6,
+                          background: isProfit ? T.greenBg : T.redBg,
+                          border: `1px solid ${isProfit ? T.greenBorder : T.redBorder}`,
+                        }}>
+                          <span style={{
+                            fontSize: 15, fontWeight: 900, fontFamily: 'monospace',
+                            color: isProfit ? T.green : T.red,
+                          }}>
+                            {isProfit ? '+' : ''}{pnl.toFixed(2)} ({fmtPct(pnlPct)})
+                          </span>
+                        </div>
+                      </div>
+
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 4, fontSize: 11, color: T.textSecondary, marginBottom: 8 }}>
+                        <span>{isAr ? 'الدخول:' : 'Entry:'} <b style={{ color: T.textPrimary }}>{fmtPrice(pos.entryPrice)}</b></span>
+                        <span>{isAr ? 'الحالي:' : 'Current:'} <b style={{ color: isProfit ? T.green : T.red }}>{fmtPrice(currentP)}</b></span>
+                        <span>{isAr ? 'المبلغ:' : 'Amount:'} <b style={{ color: T.textPrimary }}>{pos.amount.toFixed(2)}</b></span>
+                        <span>{isAr ? 'الكمية:' : 'Qty:'} <b style={{ color: T.textPrimary }}>{(pos.quantity || 0).toFixed(6)}</b></span>
+                      </div>
+
+                      {(pos.stopLoss || pos.takeProfit) && (
+                        <div style={{ display: 'flex', gap: 8, fontSize: 11, marginBottom: 8 }}>
+                          {pos.stopLoss && (
+                            <span style={{
+                              padding: '2px 8px', borderRadius: 4,
+                              background: T.redBg, border: `1px solid ${T.redBorder}`,
+                              color: T.red, fontWeight: 600,
+                            }}>
+                              {isAr ? 'وقف خسارة' : 'SL'}: {fmtPrice(pos.stopLoss)}
+                            </span>
+                          )}
+                          {pos.takeProfit && (
+                            <span style={{
+                              padding: '2px 8px', borderRadius: 4,
+                              background: T.greenBg, border: `1px solid ${T.greenBorder}`,
+                              color: T.green, fontWeight: 600,
+                            }}>
+                              {isAr ? 'هدف ربح' : 'TP'}: {fmtPrice(pos.takeProfit)}
+                            </span>
+                          )}
+                        </div>
+                      )}
+
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <span style={{ fontSize: 9, color: T.textMuted }}>{fmtTime(pos.openedAt)}</span>
+                        <motion.button
+                          whileTap={{ scale: 0.95 }}
+                          onClick={() => closePosition(pos.id)}
+                          disabled={closingId === pos.id}
+                          style={{
+                            padding: '8px 20px', background: T.redBg, border: `1px solid ${T.redBorder}`,
+                            color: T.red, borderRadius: 8, fontSize: 12, fontWeight: 700,
+                            cursor: closingId === pos.id ? 'wait' : 'pointer', fontFamily: "'Cairo', sans-serif",
+                            minHeight: 36, transition: 'all 0.2s',
+                          }}
+                        >
+                          {closingId === pos.id ? '...' : (isAr ? 'إغلاق' : 'Close')}
+                        </motion.button>
+                      </div>
+                    </div>
+                  )
+                })
+              )}
+            </motion.div>
+          ) : positionTab === 'closed' ? (
+            <motion.div key="closed" initial={{ opacity: 0, x: 10 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -10 }} transition={{ duration: 0.2 }}>
+              {closedPositions.length === 0 ? (
+                <div style={{ padding: 32, textAlign: 'center', color: T.textMuted, fontSize: 13 }}>
+                  {isAr ? 'لا يوجد سجل' : 'No closed positions'}
+                </div>
+              ) : (
+                closedPositions.map(pos => {
+                  const isProfit = pos.profitLoss >= 0
+                  return (
+                    <div key={pos.id} style={{
+                      padding: '14px 16px', borderBottom: `1px solid ${T.border}`,
+                      borderLeft: `3px solid ${isProfit ? T.green : T.red}`,
+                    }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                          <span style={{
+                            padding: '3px 10px', borderRadius: 6, fontSize: 11, fontWeight: 900,
+                            background: pos.type === 'BUY' ? T.greenBg : T.redBg,
+                            color: pos.type === 'BUY' ? T.green : T.red,
+                          }}>
+                            {pos.type === 'BUY' ? (isAr ? 'شراء' : 'BUY') : (isAr ? 'بيع' : 'SELL')}
+                          </span>
+                          <span style={{ fontSize: 14, fontWeight: 700, color: T.textPrimary }}>{pos.symbol}</span>
+                        </div>
+                        <div style={{
+                          padding: '4px 10px', borderRadius: 6,
+                          background: isProfit ? T.greenBg : T.redBg,
+                          border: `1px solid ${isProfit ? T.greenBorder : T.redBorder}`,
+                        }}>
+                          <span style={{
+                            fontSize: 15, fontWeight: 900, fontFamily: 'monospace',
+                            color: isProfit ? T.green : T.red,
+                          }}>
+                            {isProfit ? '+' : ''}{pos.profitLoss.toFixed(2)}
+                          </span>
+                        </div>
+                      </div>
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 4, fontSize: 11, color: T.textSecondary }}>
+                        <span>{isAr ? 'الدخول:' : 'Entry:'} <b style={{ color: T.textPrimary }}>{fmtPrice(pos.entryPrice)}</b></span>
+                        <span>{isAr ? 'الخروج:' : 'Exit:'} <b style={{ color: T.textPrimary }}>{fmtPrice(pos.exitPrice || 0)}</b></span>
+                        <span>{isAr ? 'المبلغ:' : 'Amount:'} <b style={{ color: T.textPrimary }}>{pos.amount.toFixed(2)}</b></span>
+                        <span>{isAr ? 'الإغلاق:' : 'Closed:'} <b style={{ color: T.textMuted }}>{pos.closedAt ? fmtDateTime(pos.closedAt) : '-'}</b></span>
+                      </div>
+                    </div>
+                  )
+                })
+              )}
+            </motion.div>
+          ) : (
+            <motion.div key="package" initial={{ opacity: 0, x: 10 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -10 }} transition={{ duration: 0.2 }}>
+              {/* SONA Package Investment Summary */}
+              {packageInvestments.length > 0 ? (
+                <div style={{ padding: 0 }}>
+                  {/* Package Summary Header */}
+                  <div style={{
+                    padding: '14px 16px',
+                    background: `linear-gradient(135deg, rgba(64,158,255,0.08) 0%, rgba(0,255,127,0.08) 100%)`,
+                    borderBottom: `1px solid ${T.accentBorder}`,
+                    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                  }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ width: 10, height: 10, borderRadius: '50%', background: T.accent, boxShadow: `0 0 8px ${T.accent}`, animation: 'pulse 2s infinite', display: 'inline-block' }} />
+                      <span style={{ fontSize: 13, color: T.accent, fontWeight: 800, fontFamily: "'Cairo', sans-serif" }}>
+                        SONA {isAr ? 'الاستثماري' : 'Investment'}
+                      </span>
+                      <span style={{ fontSize: 11, color: T.textMuted, fontWeight: 600 }}>
+                        ({packageInvestments.filter((i: any) => i.status === 'ACTIVE').length} {isAr ? 'نشطة' : 'active'})
+                      </span>
+                    </div>
+                    <span style={{ fontSize: 18, fontWeight: 900, fontFamily: 'monospace', color: investmentProfit >= 0 ? T.green : T.red }}>
+                      {investmentProfit >= 0 ? '+' : ''}{investmentProfit.toFixed(2)}
+                    </span>
+                  </div>
+
+                  {/* Active Investment Cards */}
+                  {packageInvestments.filter((inv: any) => inv.status === 'ACTIVE').map((inv: any, idx: number) => {
+                    const invTrades = packageTrades.filter((t: any) => t.investmentId === inv.id)
+                    const openTrades = invTrades.filter((t: any) => t.status === 'OPEN')
+                    const closedTrades = invTrades.filter((t: any) => t.status === 'CLOSED')
+                    const invProfit = inv.totalProfit || 0
+                    const isInvProfit = invProfit >= 0
+                    return (
+                      <div key={inv.id || idx} style={{
+                        borderBottom: `1px solid ${T.border}`,
+                        background: 'rgba(64,158,255,0.02)',
+                      }}>
+                        {/* Investment Info Row */}
+                        <div style={{ padding: '12px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                            <span style={{ padding: '2px 8px', borderRadius: 4, fontSize: 10, fontWeight: 800, background: T.accentBg, border: `1px solid ${T.accentBorder}`, color: T.accent, fontFamily: "'Cairo', sans-serif" }}>
+                              {inv.package?.name || inv.package?.nameEn || 'SONA'}
+                            </span>
+                            <span style={{ fontSize: 12, color: T.textSecondary, fontFamily: "'Cairo', sans-serif" }}>
+                              ${inv.amount?.toFixed(2)} {isAr ? 'رأس مال' : 'capital'}
+                            </span>
+                          </div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                            <span style={{ fontSize: 11, color: T.textMuted, fontFamily: "'Cairo', sans-serif" }}>
+                              {openTrades.length} {isAr ? 'مفتوحة' : 'open'} / {closedTrades.length} {isAr ? 'مغلقة' : 'closed'}
+                            </span>
+                            <span style={{ fontSize: 14, fontWeight: 900, fontFamily: 'monospace', color: isInvProfit ? T.green : T.red }}>
+                              {isInvProfit ? '+' : ''}{invProfit.toFixed(2)}
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* Trades for this investment */}
+                        {invTrades.length > 0 && invTrades.slice(0, 5).map((trade: any, tIdx: number) => {
+                          const isProfit = (trade.profitLoss || 0) >= 0
+                          const isBuy = trade.type === 'BUY'
+                          return (
+                            <div key={trade.id || tIdx} style={{
+                              padding: '10px 16px', borderTop: `1px solid ${T.border}`,
+                              borderLeft: `3px solid ${isBuy ? T.green : T.red}`,
+                              background: trade.status === 'CLOSED' ? 'rgba(255,255,255,0.01)' : 'rgba(0,255,127,0.03)',
+                            }}>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                  <span style={{
+                                    padding: '2px 8px', borderRadius: 4, fontSize: 10, fontWeight: 900,
+                                    background: isBuy ? T.greenBg : T.redBg, color: isBuy ? T.green : T.red,
+                                    border: `1px solid ${isBuy ? T.greenBorder : T.redBorder}`,
+                                  }}>
+                                    {isBuy ? (isAr ? 'شراء' : 'BUY') : (isAr ? 'بيع' : 'SELL')}
+                                  </span>
+                                  <span style={{ fontSize: 13, fontWeight: 700, color: T.textPrimary }}>{trade.symbol}</span>
+                                  {trade.status === 'OPEN' && (
+                                    <span style={{ width: 6, height: 6, borderRadius: '50%', background: T.green, animation: 'pulse 2s infinite', display: 'inline-block' }} />
+                                  )}
+                                </div>
+                                {trade.profitLoss != null && (
+                                  <span style={{ fontSize: 13, fontWeight: 900, fontFamily: 'monospace', color: isProfit ? T.green : T.red }}>
+                                    {isProfit ? '+' : ''}{trade.profitLoss.toFixed(2)}
+                                  </span>
+                                )}
+                              </div>
+                              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 4, fontSize: 10, color: T.textSecondary }}>
+                                <span>{isAr ? 'دخول:' : 'Entry:'} <b style={{ color: T.textPrimary }}>{fmtPrice(trade.entryPrice)}</b></span>
+                                {trade.exitPrice ? <span>{isAr ? 'خروج:' : 'Exit:'} <b style={{ color: T.textPrimary }}>{fmtPrice(trade.exitPrice)}</b></span> : <span>{isAr ? 'حالي:' : 'Now:'} <b style={{ color: isProfit ? T.green : T.red }}>{fmtPrice(currentPrice)}</b></span>}
+                                {trade.leverage && <span>{isAr ? 'رافعة:' : 'Lev:'} <b style={{ color: T.accent }}>×{trade.leverage}</b></span>}
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    )
+                  })}
+
+                  {/* Standalone trades not linked to an investment */}
+                  {(() => {
+                    const linkedIds = new Set(packageInvestments.filter((i: any) => i.status === 'ACTIVE').map((i: any) => i.id))
+                    const standaloneTrades = packageTrades.filter((t: any) => !linkedIds.has(t.investmentId))
+                    if (standaloneTrades.length === 0) return null
+                    return (
+                      <div style={{ padding: '8px 16px', borderTop: `1px solid ${T.border}` }}>
+                        <span style={{ fontSize: 11, color: T.textMuted, fontWeight: 600, fontFamily: "'Cairo', sans-serif" }}>
+                          {isAr ? 'صفقات سابقة' : 'Previous Trades'}
+                        </span>
+                      </div>
+                    )
+                  })()}
+                </div>
+              ) : (
+                <div style={{ padding: 32, textAlign: 'center' }}>
+                  <div style={{ fontSize: 28, marginBottom: 8, opacity: 0.3 }}>📊</div>
+                  <div style={{ color: T.textMuted, fontSize: 13, fontFamily: "'Cairo', sans-serif", marginBottom: 8 }}>
+                    {isAr ? 'لا توجد استثمارات نشطة' : 'No active investments'}
+                  </div>
+                  <div style={{ fontSize: 11, color: T.textMuted, fontFamily: "'Cairo', sans-serif" }}>
+                    {isAr ? 'اشترك في باقة SONA لبدء التداول الذكي' : 'Subscribe to a SONA package to start smart trading'}
+                  </div>
+                </div>
+              )}
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+    </div>
+  )
+
+  // ===== COMPACT MOBILE HEADER (SONA Branded - Professional) =====
+  const MobileHeader = () => (
+    <div style={{
+      background: T.bg,
+      padding: '4px 12px', paddingTop: `max(4px, env(safe-area-inset-top, 4px))`,
+      display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+      borderBottom: `1px solid ${T.border}`,
+    }}>
+      {/* Left: Back + Verified */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <motion.button whileTap={{ scale: 0.9 }} onClick={goBack} style={{
+          background: T.bg2, border: `1px solid ${T.border}`,
+          color: T.textPrimary, borderRadius: 6, width: 28, height: 28,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          cursor: 'pointer', flexShrink: 0, padding: 0,
+        }}>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M19 12H5M12 19l-7-7 7-7" />
+          </svg>
+        </motion.button>
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 2,
+          padding: '1px 6px', borderRadius: 10,
+          background: 'rgba(16,185,129,0.12)', border: '1px solid rgba(16,185,129,0.3)',
+        }}>
+          <svg width="8" height="8" viewBox="0 0 24 24" fill="#10B981">
+            <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17z" />
+          </svg>
+          <span style={{ fontSize: 7, color: '#10B981', fontWeight: 800, fontFamily: "'Cairo', sans-serif" }}>
+            {isAr ? 'تم التحقق' : 'Verified'}
+          </span>
+        </div>
+      </div>
+
+      {/* Center: SONA Logo */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+        <div style={{
+          width: 22, height: 22, borderRadius: 5,
+          background: 'linear-gradient(135deg, #3B82F6, #2563EB)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          fontSize: 12, fontWeight: 900, color: '#fff', fontFamily: 'monospace',
+          boxShadow: '0 2px 8px rgba(37,99,235,0.4)',
+        }}>
+          S
+        </div>
+        <span style={{
+          fontSize: 14, fontWeight: 900, fontFamily: 'monospace',
+          color: '#FFFFFF', letterSpacing: 1.5,
+        }}>
+          SONA
+        </span>
+      </div>
+
+      {/* Right: Bell + Profile */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <button style={{
+          background: 'transparent', border: 'none',
+          color: T.textSecondary, width: 28, height: 28,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          cursor: 'pointer', position: 'relative', padding: 0,
+        }}>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" />
+            <path d="M13.73 21a2 2 0 0 1-3.46 0" />
+          </svg>
+          {openPositions.length > 0 && (
+            <span style={{
+              position: 'absolute', top: 2, right: 2,
+              width: 10, height: 10, borderRadius: '50%',
+              background: T.red, border: `1px solid ${T.bg}`,
+              fontSize: 6, fontWeight: 900, color: '#fff',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontFamily: 'monospace',
+            }}>
+              {openPositions.length}
+            </span>
+          )}
+        </button>
+        <div style={{
+          width: 26, height: 26, borderRadius: '50%',
+          background: 'linear-gradient(135deg, #3B82F6, #6366F1)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          fontSize: 11, fontWeight: 900, color: '#fff', fontFamily: 'monospace',
+          boxShadow: '0 2px 8px rgba(59,130,246,0.3)',
+          cursor: 'pointer',
+        }}>
+          {user?.name?.charAt(0)?.toUpperCase() || 'U'}
+        </div>
+      </div>
+    </div>
+  )
+
+  // ===== DESKTOP HEADER =====
+  const DesktopHeader = () => (
+    <div style={{ background: T.card, borderBottom: `1px solid ${T.border}`, padding: '0 12px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <motion.button whileTap={{ scale: 0.9 }} onClick={goBack} style={{
+          background: T.bg2, border: `1px solid ${T.border}`,
+          color: T.textPrimary, borderRadius: 8, width: 36, height: 36,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          cursor: 'pointer', flexShrink: 0,
+        }}>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M19 12H5M12 19l-7-7 7-7" />
+          </svg>
+        </motion.button>
+
+        <div style={{ display: 'flex', gap: 2, overflowX: 'auto', scrollbarWidth: 'none', paddingTop: 8, paddingBottom: 4 }}>
+          {PAIRS.map(p => (
+            <button key={p.symbol} onClick={() => { setSelectedPair(p); setChartData([]); setLoadingChart(true) }} style={{
+              background: selectedPair.symbol === p.symbol ? T.accentBg : 'transparent',
+              border: `1px solid ${selectedPair.symbol === p.symbol ? T.accentBorder : 'transparent'}`,
+              color: selectedPair.symbol === p.symbol ? T.accent : T.textSecondary,
+              padding: '8px 14px', borderRadius: 8, fontSize: 12, fontWeight: 700,
+              cursor: 'pointer', fontFamily: "'Cairo', sans-serif", whiteSpace: 'nowrap',
+              transition: 'all 0.2s',
+            }}>
+              <span style={{ marginRight: 4 }}>{p.icon}</span> {p.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', padding: '6px 0 10px' }}>
+        <div>
+          <div style={{ fontSize: 28, fontWeight: 800, color: priceChange >= 0 ? T.green : T.red, fontFamily: 'monospace', letterSpacing: -0.5 }}>
+            {fmtPrice(currentPrice)}
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
+            <span style={{
+              fontSize: 12, fontWeight: 700, color: priceChange >= 0 ? T.green : T.red, fontFamily: 'monospace',
+              background: priceChange >= 0 ? T.greenBg : T.redBg, padding: '2px 8px', borderRadius: 4,
+            }}>
+              {fmtPct(priceChange)}
+            </span>
+            <span style={{ width: 6, height: 6, borderRadius: '50%', background: T.green, boxShadow: `0 0 8px ${T.green}`, animation: 'pulse 2s infinite' }} />
+            <span style={{ fontSize: 10, color: T.textMuted, fontWeight: 600 }}>Live</span>
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 12, alignItems: 'flex-end' }}>
+          <div style={{ textAlign: isAr ? 'left' : 'right', display: 'flex', gap: 12 }}>
+            <div>
+              <div style={{ fontSize: 9, color: T.textMuted, marginBottom: 2 }}>{isAr ? 'أعلى 24س' : '24h High'}</div>
+              <div style={{ fontSize: 11, color: T.green, fontFamily: 'monospace', fontWeight: 600 }}>{fmtPrice(binanceTicker?.high24h || 0)}</div>
+            </div>
+            <div>
+              <div style={{ fontSize: 9, color: T.textMuted, marginBottom: 2 }}>{isAr ? 'أدنى 24س' : '24h Low'}</div>
+              <div style={{ fontSize: 11, color: T.red, fontFamily: 'monospace', fontWeight: 600 }}>{fmtPrice(binanceTicker?.low24h || 0)}</div>
+            </div>
+            <div>
+              <div style={{ fontSize: 9, color: T.textMuted, marginBottom: 2 }}>{isAr ? 'حجم 24س' : '24h Vol'}</div>
+              <div style={{ fontSize: 11, color: T.textPrimary, fontFamily: 'monospace', fontWeight: 600 }}>{fmtVol(binanceTicker?.quoteVolume24h || 0)}</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+
+  // ===== MOBILE TRADING PANEL - Professional Futures (Binance/Bybit style) =====
+  const MobileTradingPanel = () => {
+    const BLUE = '#2563EB'
+    const BLUE_BG = 'rgba(37,99,235,0.15)'
+    const BLUE_BORDER = 'rgba(37,99,235,0.3)'
+    const amountNum = parseFloat(orderAmount) || 0
+    const totalValue = leverage * amountNum
+    const leverageMarkers = [1, 25, 50, 75, 100, 125]
+    const percentMarkers = [25, 50, 75, 100]
+    const baseSymbol = selectedPair.label.split('/')[0]
+
+    // Futures calculations
+    const marginMode = marginType // 'cross' | 'isolated'
+    const requiredMargin = leverage > 0 && currentPrice > 0 ? (amountNum / leverage) : 0
+    const estFeeRate = 0.0004 // 0.04% taker fee
+    const estFee = amountNum * estFeeRate
+    const liquidationPrice = (() => {
+      if (!amountNum || !currentPrice || leverage <= 0) return 0
+      const maintenanceMargin = 0.005
+      if (orderSide === 'BUY') {
+        return currentPrice * (1 - (1 / leverage) + maintenanceMargin)
+      } else {
+        return currentPrice * (1 + (1 / leverage) - maintenanceMargin)
+      }
+    })()
+
+    return (
+      <div style={{
+        background: `linear-gradient(180deg, ${T.card} 0%, #161616 100%)`,
+        borderTop: `1px solid ${T.border}`,
+        boxShadow: '0 -4px 20px rgba(0,0,0,0.4)',
+        paddingBottom: '0px',
+      }}>
+        <div style={{ padding: '10px 12px 10px' }}>
+          {/* Buy / Sell Toggle */}
+          <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
+            <button
+              onClick={() => { setTradeTab('buy'); setOrderSide('BUY') }}
+              style={{
+                flex: 1, padding: '8px 0', minHeight: 36,
+                background: orderSide === 'BUY'
+                  ? `linear-gradient(135deg, ${T.green}, #0aa06a)`
+                  : T.greenBg,
+                border: `1px solid ${orderSide === 'BUY' ? T.green : T.greenBorder}`,
+                color: orderSide === 'BUY' ? '#fff' : T.green,
+                borderRadius: 8, fontSize: 13, fontWeight: 900, cursor: 'pointer',
+                fontFamily: "'Cairo', sans-serif",
+                boxShadow: orderSide === 'BUY' ? '0 2px 12px rgba(0,255,127,0.25)' : 'none',
+                transition: 'all 0.2s',
+              }}
+            >
+              {isAr ? 'شراء' : 'BUY'}
+            </button>
+            <button
+              onClick={() => { setTradeTab('sell'); setOrderSide('SELL') }}
+              style={{
+                flex: 1, padding: '8px 0', minHeight: 36,
+                background: orderSide === 'SELL'
+                  ? `linear-gradient(135deg, ${T.red}, #d43b4f)`
+                  : T.redBg,
+                border: `1px solid ${orderSide === 'SELL' ? T.red : T.redBorder}`,
+                color: orderSide === 'SELL' ? '#fff' : T.red,
+                borderRadius: 8, fontSize: 13, fontWeight: 900, cursor: 'pointer',
+                fontFamily: "'Cairo', sans-serif",
+                boxShadow: orderSide === 'SELL' ? '0 2px 12px rgba(255,59,48,0.25)' : 'none',
+                transition: 'all 0.2s',
+              }}
+            >
+              {isAr ? 'بيع' : 'SELL'}
+            </button>
+          </div>
+
+          {/* Leverage Section */}
+          <div style={{ marginBottom: 8 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 5 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                <span style={{ fontSize: 11, color: T.textSecondary, fontWeight: 600, fontFamily: "'Cairo', sans-serif" }}>
+                  {isAr ? 'الرافعة المالية' : 'Leverage'}
+                </span>
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke={T.textMuted} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="12" cy="12" r="10" />
+                  <path d="M12 16v-4M12 8h.01" />
+                </svg>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                <span style={{ fontSize: 13, fontWeight: 900, color: BLUE, fontFamily: 'monospace' }}>{leverage}x</span>
+                <button onClick={() => handleLeverageChange(125)} style={{
+                  background: BLUE_BG, border: `1px solid ${BLUE_BORDER}`,
+                  color: BLUE, borderRadius: 3, padding: '1px 6px',
+                  fontSize: 7, fontWeight: 800, cursor: 'pointer', fontFamily: "'Cairo', sans-serif",
+                }}>
+                  MAX
+                </button>
+              </div>
+            </div>
+            {/* Leverage Slider - Smooth draggable */}
+            <div style={{ position: 'relative', padding: '0 8px', touchAction: 'none' }}
+              onTouchStart={(e) => {
+                const track = e.currentTarget.querySelector('[data-leverage-track]') as HTMLElement
+                if (!track) return
+                const rect = track.getBoundingClientRect()
+                const updateFromTouch = (clientX: number) => {
+                  const pct = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width))
+                  const newLev = Math.round(1 + pct * 124)
+                  handleLeverageChange(Math.max(1, Math.min(125, newLev)))
+                }
+                updateFromTouch(e.touches[0].clientX)
+                const onMove = (ev: TouchEvent) => { ev.preventDefault(); updateFromTouch(ev.touches[0].clientX) }
+                const onEnd = () => { document.removeEventListener('touchmove', onMove); document.removeEventListener('touchend', onEnd) }
+                document.addEventListener('touchmove', onMove, { passive: false })
+                document.addEventListener('touchend', onEnd)
+              }}
+              onMouseDown={(e) => {
+                const track = e.currentTarget.querySelector('[data-leverage-track]') as HTMLElement
+                if (!track) return
+                const rect = track.getBoundingClientRect()
+                const updateFromMouse = (clientX: number) => {
+                  const pct = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width))
+                  const newLev = Math.round(1 + pct * 124)
+                  handleLeverageChange(Math.max(1, Math.min(125, newLev)))
+                }
+                updateFromMouse(e.clientX)
+                const onMove = (ev: MouseEvent) => { updateFromMouse(ev.clientX) }
+                const onUp = () => { document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp) }
+                document.addEventListener('mousemove', onMove)
+                document.addEventListener('mouseup', onUp)
+              }}
+            >
+              <div data-leverage-track style={{ position: 'relative', height: 24, display: 'flex', alignItems: 'center', cursor: 'pointer' }}>
+                <div style={{ position: 'absolute', left: 0, right: 0, height: 4, background: T.border, borderRadius: 2 }} />
+                <div style={{ position: 'absolute', left: 0, width: `${((leverage - 1) / 124) * 100}%`, height: 4, background: `linear-gradient(90deg, ${BLUE}, #5b8def)`, borderRadius: 2, transition: 'width 0.05s ease-out', willChange: 'width' }} />
+                <div style={{
+                  position: 'absolute', left: `${((leverage - 1) / 124) * 100}%`,
+                  width: 20, height: 20, borderRadius: '50%', background: BLUE,
+                  border: '3px solid #fff', boxShadow: `0 0 10px ${BLUE}60, 0 2px 8px rgba(0,0,0,0.3)`,
+                  transform: 'translateX(-50%)',
+                  transition: 'left 0.05s ease-out',
+                  willChange: 'left',
+                }} />
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 2 }}>
+                {leverageMarkers.map(m => (
+                  <span key={m} onClick={() => handleLeverageChange(m)} style={{
+                    fontSize: 7, color: leverage === m ? BLUE : T.textMuted, fontWeight: leverage === m ? 800 : 500,
+                    cursor: 'pointer', fontFamily: 'monospace',
+                    background: leverage === m ? BLUE_BG : 'transparent', padding: '1px 3px', borderRadius: 2,
+                    transition: 'color 0.15s, background 0.15s',
+                  }}>
+                    {m}x
+                  </span>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* Cross / Isolated Margin Mode */}
+          <div style={{ display: 'flex', gap: 4, marginBottom: 4 }}>
+            <button onClick={() => setMarginType('cross')} style={{
+              flex: 1, padding: '5px 0', background: marginMode === 'cross' ? BLUE_BG : 'transparent',
+              border: `1px solid ${marginMode === 'cross' ? BLUE_BORDER : T.border}`,
+              borderRadius: 5, color: marginMode === 'cross' ? BLUE : T.textMuted,
+              fontSize: 10, fontWeight: 700, cursor: 'pointer', fontFamily: "'Cairo', sans-serif", transition: 'all 0.2s',
+            }}>
+              {isAr ? 'متقاطع Cross' : 'Cross'}
+            </button>
+            <button onClick={() => setMarginType('isolated')} style={{
+              flex: 1, padding: '5px 0', background: marginMode === 'isolated' ? BLUE_BG : 'transparent',
+              border: `1px solid ${marginMode === 'isolated' ? BLUE_BORDER : T.border}`,
+              borderRadius: 5, color: marginMode === 'isolated' ? BLUE : T.textMuted,
+              fontSize: 10, fontWeight: 700, cursor: 'pointer', fontFamily: "'Cairo', sans-serif", transition: 'all 0.2s',
+            }}>
+              {isAr ? 'معزول Isolated' : 'Isolated'}
+            </button>
+          </div>
+
+          {/* Leverage Applied Indicator */}
+          {leverageFlash && (
+            <div style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+              padding: '4px 8px', marginBottom: 6, background: 'rgba(37,99,235,0.2)',
+              border: '1px solid rgba(37,99,235,0.5)', borderRadius: 6,
+              animation: 'pulse 0.5s ease-in-out',
+            }}>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke={BLUE} strokeWidth="2.5" strokeLinecap="round">
+                <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
+              </svg>
+              <span style={{ fontSize: 10, color: BLUE, fontWeight: 800, fontFamily: 'monospace' }}>
+                ×{leverage} Leverage Applied
+              </span>
+            </div>
+          )}
+
+          {/* Amount Input */}
+          <div style={{ marginBottom: 8 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+              <span style={{ fontSize: 11, color: T.textSecondary, fontWeight: 600, fontFamily: "'Cairo', sans-serif" }}>
+                {isAr ? 'المبلغ' : 'Amount'}
+              </span>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 3, background: T.bg2, padding: '2px 8px', borderRadius: 4, border: `1px solid ${T.border}` }}>
+                <span style={{ fontSize: 10, color: T.textPrimary, fontWeight: 600 }}>USDT</span>
+                <ChevronDownIcon />
+              </div>
+            </div>
+            <div style={{
+              display: 'flex', alignItems: 'center',
+              background: T.input, border: `1px solid ${T.border}`,
+              borderRadius: 6, overflow: 'hidden', height: 36,
+            }}>
+              <input
+                type="number"
+                value={orderAmount}
+                onChange={e => { setOrderAmount(e.target.value); if (e.target.value && userBalance > 0) setAmountPercent(Math.round((parseFloat(e.target.value) / userBalance) * 100)) }}
+                onFocus={() => { isInputFocusedRef.current = true }}
+                onBlur={() => { isInputFocusedRef.current = false }}
+                placeholder="0"
+                style={{
+                  flex: 1, background: 'transparent', border: 'none', color: T.textPrimary,
+                  padding: '0 10px', fontSize: 14, fontFamily: 'monospace',
+                  fontWeight: 800, outline: 'none', minWidth: 0,
+                }}
+                dir="ltr"
+              />
+              <div style={{ paddingRight: 8, display: 'flex', alignItems: 'center', gap: 2 }}>
+                <span style={{ fontSize: 9, color: T.textMuted, fontWeight: 600 }}>USDT</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Percentage Slider + Buttons */}
+          <div style={{ marginBottom: 8 }}>
+            <div style={{ position: 'relative', padding: '0 8px', touchAction: 'none' }}
+              onTouchStart={(e) => {
+                const track = e.currentTarget.querySelector('[data-pct-track]') as HTMLElement
+                if (!track) return
+                const rect = track.getBoundingClientRect()
+                const updateFromTouch = (clientX: number) => {
+                  const pct = Math.max(0, Math.min(100, Math.round(((clientX - rect.left) / rect.width) * 100)))
+                  setAmountPercent(pct); if (userBalance > 0) setOrderAmount(((pct / 100) * userBalance).toFixed(2))
+                }
+                updateFromTouch(e.touches[0].clientX)
+                const onMove = (ev: TouchEvent) => { ev.preventDefault(); updateFromTouch(ev.touches[0].clientX) }
+                const onEnd = () => { document.removeEventListener('touchmove', onMove); document.removeEventListener('touchend', onEnd) }
+                document.addEventListener('touchmove', onMove, { passive: false })
+                document.addEventListener('touchend', onEnd)
+              }}
+              onMouseDown={(e) => {
+                const track = e.currentTarget.querySelector('[data-pct-track]') as HTMLElement
+                if (!track) return
+                const rect = track.getBoundingClientRect()
+                const updateFromMouse = (clientX: number) => {
+                  const pct = Math.max(0, Math.min(100, Math.round(((clientX - rect.left) / rect.width) * 100)))
+                  setAmountPercent(pct); if (userBalance > 0) setOrderAmount(((pct / 100) * userBalance).toFixed(2))
+                }
+                updateFromMouse(e.clientX)
+                const onMove = (ev: MouseEvent) => { updateFromMouse(ev.clientX) }
+                const onUp = () => { document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp) }
+                document.addEventListener('mousemove', onMove)
+                document.addEventListener('mouseup', onUp)
+              }}
+            >
+              <div data-pct-track style={{ position: 'relative', height: 20, display: 'flex', alignItems: 'center', cursor: 'pointer' }}>
+                <div style={{ position: 'absolute', left: 0, right: 0, height: 3, background: T.border, borderRadius: 2 }} />
+                <div style={{ position: 'absolute', left: 0, width: `${orderPercent}%`, height: 3, background: BLUE, borderRadius: 2, transition: 'width 0.05s ease-out', willChange: 'width' }} />
+                <div style={{
+                  position: 'absolute', left: `${orderPercent}%`,
+                  width: 16, height: 16, borderRadius: '50%', background: BLUE,
+                  border: '2px solid #fff', boxShadow: `0 0 8px ${BLUE}40`,
+                  transform: 'translateX(-50%)',
+                  transition: 'left 0.05s ease-out',
+                  willChange: 'left',
+                }} />
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: 4, marginTop: 4 }}>
+              {percentMarkers.map(pct => (
+                <button key={pct} onClick={() => { setAmountPercent(pct); if (userBalance > 0) setOrderAmount(((pct / 100) * userBalance).toFixed(2)) }} style={{
+                  flex: 1, padding: 4, background: orderPercent === pct ? BLUE_BG : 'transparent',
+                  border: `1px solid ${orderPercent === pct ? BLUE_BORDER : T.border}`,
+                  color: orderPercent === pct ? BLUE : T.textMuted,
+                  borderRadius: 4, fontSize: 9, fontWeight: 700, cursor: 'pointer',
+                  fontFamily: "'Cairo', sans-serif", transition: 'all 0.2s',
+                }}>
+                  {pct}%
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Stop Loss / Take Profit (always visible) */}
+          <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 9, color: T.red, fontWeight: 700, marginBottom: 2, fontFamily: "'Cairo', sans-serif" }}>
+                {isAr ? 'وقف خسارة' : 'Stop Loss'}
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', background: T.input, border: `1px solid ${T.redBorder}`, borderRadius: 5, overflow: 'hidden', height: 30 }}>
+                <input type="number" value={stopLoss} onChange={e => setStopLoss(e.target.value)} onFocus={() => { isInputFocusedRef.current = true }} onBlur={() => { isInputFocusedRef.current = false }} placeholder={currentPrice > 0 ? fmtPrice(currentPrice * 0.98) : '0'} style={{
+                  flex: 1, background: 'transparent', border: 'none', color: T.red, padding: '0 6px',
+                  fontSize: 11, fontFamily: 'monospace', fontWeight: 700, outline: 'none', minWidth: 0,
+                }} dir="ltr" />
+              </div>
+            </div>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 9, color: T.green, fontWeight: 700, marginBottom: 2, fontFamily: "'Cairo', sans-serif" }}>
+                {isAr ? 'جني أرباح' : 'Take Profit'}
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', background: T.input, border: `1px solid ${T.greenBorder}`, borderRadius: 5, overflow: 'hidden', height: 30 }}>
+                <input type="number" value={takeProfit} onChange={e => setTakeProfit(e.target.value)} onFocus={() => { isInputFocusedRef.current = true }} onBlur={() => { isInputFocusedRef.current = false }} placeholder={currentPrice > 0 ? fmtPrice(currentPrice * 1.02) : '0'} style={{
+                  flex: 1, background: 'transparent', border: 'none', color: T.green, padding: '0 6px',
+                  fontSize: 11, fontFamily: 'monospace', fontWeight: 700, outline: 'none', minWidth: 0,
+                }} dir="ltr" />
+              </div>
+            </div>
+          </div>
+
+          {/* Total Display - Prominent standalone line */}
+          <div style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            padding: '6px 10px', marginBottom: 6, background: T.bg2,
+            borderRadius: 6, border: `1px solid ${T.border}`,
+          }}>
+            <span style={{ fontSize: 11, color: T.textSecondary, fontWeight: 600, fontFamily: "'Cairo', sans-serif" }}>
+              {isAr ? 'المجموع:' : 'Total:'}
+            </span>
+            <span style={{ fontSize: 14, fontWeight: 900, color: BLUE, fontFamily: 'monospace' }}>
+              {amountNum > 0 ? totalValue.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '0.00'}
+            </span>
+          </div>
+
+          {/* Futures Info Row - Compact */}
+          <div style={{
+            display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 4,
+            marginBottom: 8, fontSize: 8,
+          }}>
+            <div style={{ background: T.bg2, borderRadius: 4, padding: '4px 6px', textAlign: 'center', borderLeft: `2px solid ${BLUE}` }}>
+              <div style={{ color: T.textMuted, fontFamily: "'Cairo', sans-serif", fontWeight: 600, fontSize: 7 }}>{isAr ? 'الهامش المطلوب' : 'Req. Margin'}</div>
+              <div style={{ color: T.textPrimary, fontWeight: 800, fontFamily: 'monospace', fontSize: 9 }}>{requiredMargin.toFixed(2)}</div>
+            </div>
+            <div style={{ background: T.bg2, borderRadius: 4, padding: '4px 6px', textAlign: 'center', borderLeft: `2px solid ${T.red}` }}>
+              <div style={{ color: T.textMuted, fontFamily: "'Cairo', sans-serif", fontWeight: 600, fontSize: 7 }}>{isAr ? 'سعر التصفية' : 'Liq. Price'}</div>
+              <div style={{ color: T.red, fontWeight: 800, fontFamily: 'monospace', fontSize: 9 }}>{liquidationPrice > 0 ? fmtPrice(liquidationPrice) : '--'}</div>
+            </div>
+            <div style={{ background: T.bg2, borderRadius: 4, padding: '4px 6px', textAlign: 'center', borderLeft: `2px solid ${T.textMuted}` }}>
+              <div style={{ color: T.textMuted, fontFamily: "'Cairo', sans-serif", fontWeight: 600, fontSize: 7 }}>{isAr ? 'الرسوم التقديرية' : 'Est. Fee'}</div>
+              <div style={{ color: T.textPrimary, fontWeight: 800, fontFamily: 'monospace', fontSize: 9 }}>{estFee.toFixed(2)}</div>
+            </div>
+          </div>
+
+          {/* Available Balance */}
+          <div style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            padding: '4px 0', marginBottom: 6,
+          }}>
+            <span style={{ fontSize: 10, color: T.textSecondary, fontWeight: 600, fontFamily: "'Cairo', sans-serif" }}>
+              {isAr ? 'موجود:' : 'Available:'}
+            </span>
+            <span style={{ fontSize: 12, fontWeight: 900, color: T.textPrimary, fontFamily: 'monospace' }}>
+              {userBalance.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            </span>
+          </div>
+
+          {/* Investment Profit Badge - shows when package is active */}
+          {hasActivePackage && (
+            <div style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              padding: '8px 12px', marginBottom: 8,
+              background: investmentProfit >= 0 ? T.greenBg : T.redBg,
+              border: `1px solid ${investmentProfit >= 0 ? T.greenBorder : T.redBorder}`,
+              borderRadius: 8,
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={investmentProfit >= 0 ? T.green : T.red} strokeWidth="2" strokeLinecap="round">
+                  <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
+                </svg>
+                <span style={{ fontSize: 10, fontWeight: 700, fontFamily: "'Cairo', sans-serif", color: investmentProfit >= 0 ? T.green : T.red }}>
+                  {isAr ? 'أرباح الاستثمار' : 'Investment Profit'}
+                </span>
+              </div>
+              <span style={{ fontSize: 13, fontWeight: 900, fontFamily: 'monospace', color: investmentProfit >= 0 ? T.green : T.red }}>
+                {investmentProfit >= 0 ? '+' : ''}{investmentProfit.toFixed(2)}
+              </span>
+            </div>
+          )}
+
+          {/* ★ EXECUTE BUTTON ★ */}
+          <div>
+            <motion.button
+              whileTap={{ scale: 0.96 }}
+              onClick={() => executeOrder()}
+              disabled={submitting}
+              style={{
+                width: '100%', minHeight: 48,
+                background: orderSide === 'BUY'
+                  ? `linear-gradient(135deg, ${T.green}, #0aa06a)`
+                  : `linear-gradient(135deg, ${T.red}, #d43b4f)`,
+                border: 'none', color: '#fff', borderRadius: 8, fontSize: 14, fontWeight: 900,
+                cursor: submitting ? 'not-allowed' : 'pointer', fontFamily: "'Cairo', sans-serif",
+                opacity: submitting ? 0.6 : 1,
+                display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+                transition: 'opacity 0.2s',
+                boxShadow: orderSide === 'BUY' ? '0 4px 20px rgba(0,255,127,0.3)' : '0 4px 20px rgba(255,59,48,0.3)',
+                willChange: 'opacity',
+              }}
+            >
+              {submitting ? (
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                  <span style={{ width: 14, height: 14, border: '2px solid rgba(255,255,255,0.3)', borderTopColor: '#fff', borderRadius: '50%', animation: 'spin 0.8s linear infinite', display: 'inline-block', willChange: 'transform' }} />
+                  {isAr ? 'جارٍ التنفيذ...' : 'Executing...'}
+                </span>
+              ) : (
+                `${orderSide === 'BUY' ? (isAr ? 'شراء' : 'BUY') : (isAr ? 'بيع' : 'SELL')} ${baseSymbol} ×${leverage}`
+              )}
+            </motion.button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // ===== DESKTOP CHART TOOLBAR (inline indicator toggles) =====
+  const DesktopChartToolbar = () => (
+    <div style={{ display: 'flex', gap: 4, padding: '6px 8px', flexWrap: 'wrap', alignItems: 'center' }}>
+      {INDICATORS.map(ind => (
+        <button key={ind.key} onClick={ind.toggle} style={{
+          padding: '3px 10px', borderRadius: 4, fontSize: 10, fontWeight: 700, cursor: 'pointer',
+          background: ind.active ? `${ind.color}20` : 'transparent',
+          color: ind.active ? ind.color : T.textMuted,
+          border: `1px solid ${ind.active ? `${ind.color}40` : 'transparent'}`,
+          fontFamily: 'monospace', transition: 'all 0.2s',
+        }}>
+          {ind.label}
+        </button>
+      ))}
+      <div style={{ width: 1, height: 16, background: T.border, margin: '0 4px' }} />
+      {DRAW_TOOLS.map(tool => (
+        <button key={tool.key} onClick={() => setActiveDrawTool(activeDrawTool === tool.key ? null : tool.key)} title={tool.label} style={{
+          padding: '3px 8px', borderRadius: 4, fontSize: 12, fontWeight: 900, cursor: 'pointer',
+          background: activeDrawTool === tool.key ? `${tool.color}30` : 'transparent',
+          color: activeDrawTool === tool.key ? tool.color : T.textMuted,
+          border: `1px solid ${activeDrawTool === tool.key ? `${tool.color}50` : 'transparent'}`,
+          fontFamily: 'monospace', transition: 'all 0.2s', lineHeight: 1,
+        }}>
+          {tool.symbol}
+        </button>
+      ))}
+      {(drawings?.length || 0) > 0 && (
+        <button onClick={() => setDrawings([])} title={isAr ? 'مسح الرسوم' : 'Clear drawings'} style={{
+          padding: '3px 8px', borderRadius: 4, fontSize: 10, fontWeight: 700, cursor: 'pointer',
+          background: T.redBg, color: T.red,
+          border: `1px solid ${T.redBorder}`,
+          fontFamily: 'monospace', transition: 'all 0.2s',
+        }}>
+          {isAr ? 'مسح' : 'Clear'}
+        </button>
+      )}
+      <div style={{ width: 1, height: 16, background: T.border, margin: '0 4px' }} />
+      <button onClick={() => setShowSignalLines(!showSignalLines)} style={{
+        padding: '3px 10px', borderRadius: 4, fontSize: 10, fontWeight: 700, cursor: 'pointer',
+        background: showSignalLines ? `${T.green}20` : 'transparent',
+        color: showSignalLines ? T.green : T.textMuted,
+        border: `1px solid ${showSignalLines ? `${T.green}40` : 'transparent'}`,
+        fontFamily: 'monospace', transition: 'all 0.2s',
+      }}>
+        {isAr ? 'إشارات' : 'Signals'}
+      </button>
+      {activeDrawTool && (
+        <span style={{ fontSize: 9, color: T.accent, fontWeight: 600 }}>
+          {isAr ? 'اضغط نقطتين على الرسم' : 'Click 2 points on chart'}
+        </span>
+      )}
+    </div>
+  )
+
+  // ===== MAIN RENDER =====
+  return (
+    <div style={{ background: T.bg, minHeight: '100vh', direction: isAr ? 'rtl' : 'ltr', fontFamily: "'Cairo', sans-serif" }}>
+      {/* CSS animations */}
+      <style>{`
+        @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .tv-lightweight-charts a[href*="tradingview"] { display: none !important; }
+        .tv-lightweight-charts > div > a { display: none !important; }
+        div[id^="tv-"] a { display: none !important; }
+        /* Smooth slider styles */
+        input[type="range"] { -webkit-appearance: none; appearance: none; background: transparent; }
+        input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 14px; height: 14px; background: transparent; cursor: pointer; }
+        input[type="range"]::-moz-range-thumb { width: 14px; height: 14px; background: transparent; cursor: pointer; border: none; }
+        /* GPU acceleration for animated elements */
+        .sona-trade-btn { will-change: transform; }
+        .sona-pulse-dot { will-change: opacity; }
+      `}</style>
+
+      {/* Order Success Overlay */}
+      <AnimatePresence>
+        {orderSuccess && <OrderSuccessOverlay success={orderSuccess} isAr={isAr} />}
+      </AnimatePresence>
+
+      {/* Toast */}
+      <AnimatePresence>
+        {toast && (
+          <motion.div
+            initial={{ opacity: 0, y: -20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -20 }}
+            style={{
+              position: 'fixed', top: 80, left: '50%', transform: 'translateX(-50%)', zIndex: 999,
+              background: toast.type === 'ok' ? T.greenBg : toast.type === 'err' ? T.redBg : T.blueBg,
+              border: `1px solid ${toast.type === 'ok' ? T.greenBorder : toast.type === 'err' ? T.redBorder : T.blueBorder}`,
+              color: toast.type === 'ok' ? T.green : toast.type === 'err' ? T.red : T.blue,
+              padding: '12px 24px', borderRadius: 10, fontSize: 13, fontWeight: 600, fontFamily: "'Cairo', sans-serif",
+              backdropFilter: 'blur(12px)', boxShadow: '0 8px 32px rgba(0,0,0,0.4)', maxWidth: 400, textAlign: 'center',
+            }}
+          >
+            {toast.msg}
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ===== DESKTOP LAYOUT ===== */}
+      <div className="hidden md:block">
+        <DesktopHeader />
+
+        {/* Timeframe Selector */}
+        <div style={{ display: 'flex', gap: 2, padding: '6px 12px', background: T.bg2, borderBottom: `1px solid ${T.border}` }}>
+          {TIMEFRAMES.map(tf => (
+            <button key={tf} onClick={() => { setTimeframe(tf); setChartData([]); setLoadingChart(true) }} style={{
+              flex: 1, padding: '7px 0', background: timeframe === tf ? T.accentBg : 'transparent',
+              border: `1px solid ${timeframe === tf ? T.accentBorder : 'transparent'}`,
+              color: timeframe === tf ? T.accent : T.textMuted,
+              borderRadius: 6, fontSize: 11, fontWeight: 700, cursor: 'pointer',
+              fontFamily: "'Cairo', sans-serif", transition: 'all 0.2s',
+            }}>
+              {tf}
+            </button>
+          ))}
+        </div>
+
+        <div style={{ display: 'flex', gap: 0, minHeight: 'calc(100vh - 140px)' }}>
+          {/* Left: Chart + Positions */}
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ background: T.bg, borderBottom: `1px solid ${T.border}` }}>
+              <DesktopChartToolbar />
+              <SonaChart
+                candles={chartData} selectedPair={selectedPair} isAr={isAr}
+                openPositions={openPositions} drawings={drawings} onDrawingsChange={setDrawings}
+                activeDrawTool={activeDrawTool} onSetActiveDrawTool={setActiveDrawTool}
+                showEMA={showEMA} showBB={showBB} showRSI={showRSI} showMACD={showMACD}
+                showStoch={showStoch} showATR={showATR} showSignalLines={showSignalLines}
+                chartHeight={400}
+              />
+            </div>
+            <div style={{ padding: 16 }}>
+              <PositionsPanel showSummary />
+            </div>
+          </div>
+          {/* Right: Order Book + Trading Panel */}
+          <div style={{ width: 340, borderLeft: `1px solid ${T.border}`, background: T.bg2, display: 'flex', flexDirection: 'column' }}>
+            <div style={{ borderBottom: `1px solid ${T.border}`, padding: 8 }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: T.textSecondary, padding: '4px 8px 8px', fontFamily: "'Cairo', sans-serif" }}>
+                {isAr ? 'دفتر الأوامر' : 'Order Book'}
+              </div>
+              <OrderBookPanel />
+            </div>
+            <div style={{ flex: 1, overflow: 'auto', padding: 12 }}>
+              <TradingPanel />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ===== MOBILE LAYOUT ===== */}
+      <div className="block md:hidden" style={{ display: 'flex', flexDirection: 'column', minHeight: '100vh' }}>
+        {/* Header: Menu | SONA Logo | Bell */}
+        <MobileHeader />
+
+        {/* Market Info Section: Pair + Price + Change */}
+        <div style={{
+          background: `linear-gradient(180deg, ${T.bg} 0%, ${T.bg2} 100%)`,
+          borderBottom: `1px solid ${T.border}`,
+          padding: '10px 14px', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        }}>
+          {/* Left: Pair selector */}
+          <div ref={pairDropdownRef} style={{ position: 'relative' }}>
+            <button
+              onClick={() => setPairDropdownOpen(!pairDropdownOpen)}
+              style={{
+                background: T.bg2, border: `1px solid ${T.border}`,
+                color: T.textPrimary, borderRadius: 6, padding: '5px 10px',
+                fontSize: 14, fontWeight: 900, cursor: 'pointer', fontFamily: 'monospace',
+                display: 'flex', alignItems: 'center', gap: 4,
+              }}
+            >
+              <span>{selectedPair.icon}</span>
+              <span>{selectedPair.label}</span>
+              <span style={{ color: T.textSecondary }}><ChevronDownIcon /></span>
+            </button>
+            <div style={{ fontSize: 9, color: T.blue, fontWeight: 600, marginTop: 2, fontFamily: "'Cairo', sans-serif", display: 'flex', alignItems: 'center', gap: 3 }}>
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke={T.blue} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M3 3v18h18" /><path d="M7 16l4-8 4 4 5-9" />
+              </svg>
+              {isAr ? 'مؤشر' : 'Index'}
+            </div>
+            <AnimatePresence>
+              {pairDropdownOpen && (
+                <motion.div
+                  initial={{ opacity: 0, y: -4 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -4 }}
+                  transition={{ duration: 0.15 }}
+                  style={{
+                    position: 'absolute', top: '100%', left: 0, zIndex: 100,
+                    background: T.card, border: `1px solid ${T.border}`,
+                    borderRadius: 10, marginTop: 4, minWidth: 160,
+                    boxShadow: '0 8px 32px rgba(0,0,0,0.5)', overflow: 'hidden',
+                  }}
+                >
+                  {PAIRS.map(p => (
+                    <button key={p.symbol} onClick={() => {
+                      setSelectedPair(p); setChartData([]); setLoadingChart(true); setPairDropdownOpen(false)
+                    }} style={{
+                      display: 'flex', alignItems: 'center', gap: 8, width: '100%',
+                      padding: '10px 14px', background: selectedPair.symbol === p.symbol ? T.accentBg : 'transparent',
+                      border: 'none', color: selectedPair.symbol === p.symbol ? T.accent : T.textSecondary,
+                      fontSize: 13, fontWeight: 700, cursor: 'pointer', fontFamily: "'Cairo', sans-serif",
+                      textAlign: 'left',
+                    }}>
+                      <span>{p.icon}</span> {p.label}
+                      {livePrices[p.label] && (
+                        <span style={{ marginLeft: 'auto', fontSize: 11, fontFamily: 'monospace', color: T.textMuted }}>
+                          {fmtPrice(livePrices[p.label])}
+                        </span>
+                      )}
+                    </button>
+                  ))}
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+
+          {/* Center: Price */}
+          <div style={{ textAlign: 'center' }}>
+            <div style={{
+              fontSize: 28, fontWeight: 900, fontFamily: 'monospace', lineHeight: 1.1,
+              color: priceChange >= 0 ? T.green : T.red,
+              textShadow: `0 0 20px ${priceChange >= 0 ? 'rgba(0,255,127,0.3)' : 'rgba(255,59,48,0.3)'}`,
+              display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+            }}>
+              {fmtPrice(currentPrice)}
+              <span style={{
+                width: 6, height: 6, borderRadius: '50%',
+                background: priceChange >= 0 ? T.green : T.red,
+                boxShadow: `0 0 8px ${priceChange >= 0 ? T.green : T.red}`,
+                animation: 'pulse 2s infinite', display: 'inline-block', flexShrink: 0,
+              }} />
+            </div>
+            <div style={{
+              fontSize: 10, color: priceChange >= 0 ? T.green : T.red,
+              fontFamily: 'monospace', marginTop: 2, fontWeight: 700,
+              background: priceChange >= 0 ? T.greenBg : T.redBg,
+              padding: '1px 8px', borderRadius: 4, display: 'inline-block',
+            }}>
+              {fmtPct(priceChange)}
+            </div>
+          </div>
+
+          {/* Right: 24h Change */}
+          <div style={{ textAlign: 'right' }}>
+            <div style={{
+              fontSize: 9, color: T.textMuted, fontWeight: 600, fontFamily: "'Cairo', sans-serif",
+              marginBottom: 2,
+            }}>
+              {isAr ? 'التغير' : 'Change'}
+            </div>
+            <div style={{
+              fontSize: 14, fontWeight: 800, fontFamily: 'monospace',
+              color: priceChange >= 0 ? T.green : T.red,
+              display: 'flex', alignItems: 'center', gap: 3, justifyContent: 'flex-end',
+            }}>
+              {priceChange < 0 && (
+                <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M12 19V5M5 12l7-7 7 7" style={{ transform: 'rotate(180deg)', transformOrigin: '12px 12px' }} />
+                </svg>
+              )}
+              {priceChange >= 0 && (
+                <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M12 5v14M5 12l7 7 7-7" />
+                </svg>
+              )}
+              {fmtPct(priceChange)}
+            </div>
+            <div style={{ fontSize: 8, color: T.textMuted, fontFamily: 'monospace', marginTop: 2 }}>
+              24h
+            </div>
+          </div>
+        </div>
+
+        {/* 24h Market Stats: 4 boxes - Clean compact */}
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 3, padding: '4px 8px', background: T.bg2, borderBottom: `1px solid ${T.border}` }}>
+          {[
+            { label: isAr ? 'أعلى' : 'High', value: fmtPrice(binanceTicker?.high24h || 0), color: T.green },
+            { label: isAr ? 'أدنى' : 'Low', value: fmtPrice(binanceTicker?.low24h || 0), color: T.red },
+            { label: isAr ? 'الحجم' : 'Vol', value: `${fmtVol(binanceTicker?.quoteVolume24h || 0)}`, color: T.accent },
+            { label: isAr ? 'التغير' : 'Chg', value: fmtPct(priceChange), color: priceChange >= 0 ? T.green : T.red },
+          ].map((stat, i) => (
+            <div key={i} style={{
+              background: T.card, borderRadius: 4, padding: '3px 5px',
+              display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+            }}>
+              <span style={{ fontSize: 7, color: T.textMuted, fontWeight: 600, fontFamily: "'Cairo', sans-serif", textAlign: 'center', lineHeight: 1.1 }}>
+                {stat.label}
+              </span>
+              <span style={{ fontSize: 8, color: stat.color, fontWeight: 800, fontFamily: 'monospace', marginTop: 1, textAlign: 'center' }}>
+                {stat.value}
+              </span>
+            </div>
+          ))}
+        </div>
+
+        {/* Timeframe Buttons Row */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 2, padding: '4px 8px', background: T.bg2, borderBottom: `1px solid ${T.border}` }}>
+          {TIMEFRAMES.map(tf => (
+            <button key={tf} onClick={() => { setTimeframe(tf); setChartData([]); setLoadingChart(true) }} style={{
+              flex: 1, padding: '6px 0', background: timeframe === tf ? T.blueBg : 'transparent',
+              border: `1px solid ${timeframe === tf ? T.blueBorder : 'transparent'}`,
+              color: timeframe === tf ? T.blue : T.textMuted,
+              borderRadius: 4, fontSize: 10, fontWeight: 700, cursor: 'pointer',
+              fontFamily: "'Cairo', sans-serif", transition: 'all 0.2s',
+            }}>
+              {tf}
+            </button>
+          ))}
+          {/* Charts button */}
+          <button style={{
+            padding: '6px 8px', background: T.blueBg,
+            border: `1px solid ${T.blueBorder}`,
+            color: T.blue, borderRadius: 4, fontSize: 10, fontWeight: 700, cursor: 'pointer',
+            fontFamily: "'Cairo', sans-serif", transition: 'all 0.2s',
+            display: 'flex', alignItems: 'center', gap: 3, whiteSpace: 'nowrap',
+          }}>
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+              <path d="M3 3v18h18" /><path d="M7 16l4-8 4 4 5-9" />
+            </svg>
+            {isAr ? 'الرسوم' : 'Charts'}
+          </button>
+          {/* Chart type icons */}
+          <button style={{
+            padding: '6px 8px', background: T.blueBg,
+            border: `1px solid ${T.blueBorder}`,
+            color: T.blue, borderRadius: 4, fontSize: 10, fontWeight: 700, cursor: 'pointer',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all 0.2s',
+          }}>
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+              <path d="M18 20V10M12 20V4M6 20v-6" />
+            </svg>
+          </button>
+          <button style={{
+            padding: '6px 8px', background: 'transparent',
+            border: '1px solid transparent',
+            color: T.textMuted, borderRadius: 4, fontSize: 10, fontWeight: 700, cursor: 'pointer',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all 0.2s',
+          }}>
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+              <rect x="3" y="3" width="7" height="7" /><rect x="14" y="3" width="7" height="7" /><rect x="14" y="14" width="7" height="7" /><rect x="3" y="14" width="7" height="7" />
+            </svg>
+          </button>
+        </div>
+
+        {/* Scrollable Content: Chart + Indicators + OrderBook toggle */}
+        <div style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', position: 'relative' }}>
+          {/* Chart Area */}
+          <div style={{ position: 'relative' }}>
+            <FloatingToolbar />
+            <SonaChart
+              candles={chartData} selectedPair={selectedPair} isAr={isAr}
+              openPositions={openPositions} drawings={drawings} onDrawingsChange={setDrawings}
+              activeDrawTool={activeDrawTool} onSetActiveDrawTool={setActiveDrawTool}
+              showEMA={showEMA} showBB={showBB} showRSI={showRSI} showMACD={showMACD}
+              showStoch={showStoch} showATR={showATR} showSignalLines={showSignalLines}
+              chartHeight={300}
+            />
+          </div>
+
+          {/* Active Positions Quick View - Always visible above chart */}
+          {openPositions.length > 0 && (
+            <div style={{
+              padding: '4px 8px', background: T.bg2,
+              borderBottom: `1px solid ${totalPnl >= 0 ? T.greenBorder : T.redBorder}`,
+              display: 'flex', gap: 6, overflowX: 'auto', scrollbarWidth: 'none',
+            }}>
+              {openPositions.map(pos => {
+                const { pnl } = calculatePnL(pos)
+                const isBuy = pos.type === 'BUY'
+                const isProfit = pnl >= 0
+                const posSymbol = pos.symbol || ''
+                const isActive = posSymbol === selectedPair.label || posSymbol === selectedPair.symbol
+                return (
+                  <button key={pos.id} onClick={() => {
+                    // Switch to the pair of this position
+                    const matchPair = PAIRS.find(p => p.label === posSymbol || p.symbol === posSymbol)
+                    if (matchPair && matchPair.symbol !== selectedPair.symbol) {
+                      setSelectedPair(matchPair)
+                      setChartData([])
+                      setLoadingChart(true)
+                    }
+                  }} style={{
+                    display: 'flex', alignItems: 'center', gap: 4,
+                    padding: '3px 8px', borderRadius: 6, cursor: 'pointer',
+                    background: isActive ? (isProfit ? T.greenBg : T.redBg) : T.card,
+                    border: `1px solid ${isActive ? (isProfit ? T.greenBorder : T.redBorder) : T.border}`,
+                    whiteSpace: 'nowrap', flexShrink: 0, transition: 'all 0.2s',
+                  }}>
+                    <span style={{
+                      width: 5, height: 5, borderRadius: '50%',
+                      background: isBuy ? T.green : T.red,
+                      boxShadow: `0 0 4px ${isBuy ? T.green : T.red}`,
+                      animation: 'pulse 2s infinite', display: 'inline-block',
+                    }} />
+                    <span style={{ fontSize: 9, fontWeight: 800, color: isBuy ? T.green : T.red, fontFamily: 'monospace' }}>
+                      {isBuy ? 'B' : 'S'}
+                    </span>
+                    <span style={{ fontSize: 9, fontWeight: 700, color: T.textPrimary }}>
+                      {posSymbol.replace('/USDT', '')}
+                    </span>
+                    <span style={{ fontSize: 9, fontWeight: 900, fontFamily: 'monospace', color: isProfit ? T.green : T.red }}>
+                      {isProfit ? '+' : ''}{pnl.toFixed(2)}
+                    </span>
+                  </button>
+                )
+              })}
+            </div>
+          )}
+
+          {/* Order Book Toggle */}
+          <div style={{ padding: '0 8px' }}>
+            <button onClick={() => setShowMobileOrderBook(!showMobileOrderBook)} style={{
+              width: '100%', padding: '8px 0', background: T.card,
+              border: `1px solid ${T.border}`, borderRadius: 6,
+              color: T.textSecondary, fontSize: 11, fontWeight: 700,
+              cursor: 'pointer', fontFamily: "'Cairo', sans-serif",
+              display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+            }}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <path d="M3 3h7v7H3zM14 3h7v7h-7zM14 14h7v7h-7zM3 14h7v7H3z" />
+              </svg>
+              {isAr ? 'دفتر الأوامر' : 'Order Book'}
+              <span style={{ transform: showMobileOrderBook ? 'rotate(180deg)' : 'rotate(0deg)', transition: 'transform 0.2s', display: 'inline-block' }}>▼</span>
+            </button>
+            <AnimatePresence>
+              {showMobileOrderBook && (
+                <motion.div
+                  initial={{ height: 0, opacity: 0 }}
+                  animate={{ height: 'auto', opacity: 1 }}
+                  exit={{ height: 0, opacity: 0 }}
+                  transition={{ duration: 0.2 }}
+                  style={{ overflow: 'hidden', background: T.card, borderRadius: '0 0 8px 8px' }}
+                >
+                  <div style={{ padding: 8 }}>
+                    <OrderBookPanel compact />
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+
+          {/* Positions Floating Section */}
+          {openPositions.length > 0 && (
+            <div style={{ padding: '8px 8px 0' }}>
+              <button onClick={() => setShowMobilePositions(!showMobilePositions)} style={{
+                width: '100%', padding: '8px 12px', background: totalPnl >= 0 ? T.greenBg : T.redBg,
+                border: `1px solid ${totalPnl >= 0 ? T.greenBorder : T.redBorder}`,
+                borderRadius: 8, color: totalPnl >= 0 ? T.green : T.red,
+                fontSize: 12, fontWeight: 700, cursor: 'pointer', fontFamily: "'Cairo', sans-serif",
+                display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              }}>
+                <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                    <rect x="2" y="7" width="20" height="14" rx="2" ry="2" />
+                    <path d="M16 21V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v16" />
+                  </svg>
+                  {isAr ? `صفقات مفتوحة (${openPositions.length})` : `Open Positions (${openPositions.length})`}
+                </span>
+                <span style={{ fontFamily: 'monospace', fontWeight: 900 }}>
+                  {totalPnl >= 0 ? '+' : ''}{totalPnl.toFixed(2)}
+                  <span style={{ marginLeft: 4, transform: showMobilePositions ? 'rotate(180deg)' : 'rotate(0deg)', transition: 'transform 0.2s', display: 'inline-block' }}>▼</span>
+                </span>
+              </button>
+              <AnimatePresence>
+                {showMobilePositions && (
+                  <motion.div
+                    initial={{ height: 0, opacity: 0 }}
+                    animate={{ height: 'auto', opacity: 1 }}
+                    exit={{ height: 0, opacity: 0 }}
+                    transition={{ duration: 0.2 }}
+                    style={{ overflow: 'hidden' }}
+                  >
+                    <PositionsPanel showSummary />
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+          )}
+
+          {/* Spacer for bottom trading panel */}
+          <div style={{ height: 12 }} />
+        </div>
+
+        {/* Trading Panel - Fixed at bottom - called as function to prevent React unmount/remount on re-render */}
+        {MobileTradingPanel()}
+      </div>
+    </div>
+  )
+}
+
+export default TradingPage
