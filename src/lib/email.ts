@@ -3,14 +3,21 @@ import { Resend } from 'resend';
 
 // ═══════════════════════════════════════════════════════════════════
 // EMAIL PROVIDER CONFIGURATION
-// Primary: Resend API (works on Render - no SMTP port blocking)
-// Fallback: Nodemailer SMTP (Gmail - blocked on Render but works locally)
+// Primary: Brevo API (works on Render, no domain verification needed)
+// Fallback: Resend API (only sends to account owner without domain verification)
+// Last resort: Nodemailer SMTP (Gmail - blocked on Render but works locally)
 // ═══════════════════════════════════════════════════════════════════
 
+// Brevo (formerly Sendinblue) - primary email provider
+const BREVO_API_KEY = process.env.BREVO_API_KEY || '';
+const BREVO_FROM_EMAIL = process.env.BREVO_FROM_EMAIL || 'helpsona.support@gmail.com';
+const BREVO_FROM_NAME = process.env.BREVO_FROM_NAME || 'SONA Platform';
+
+// Resend configuration (fallback)
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const RESEND_FROM_EMAIL = process.env.RESEND_FROM_EMAIL || 'SONA Platform <onboarding@resend.dev>';
 
-// SMTP configuration from environment (fallback)
+// SMTP configuration from environment (last resort)
 const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
 const SMTP_PORT = parseInt(process.env.SMTP_PORT || '587');
 const SMTP_USER = process.env.SMTP_USER || '';
@@ -18,15 +25,24 @@ const SMTP_PASS = process.env.SMTP_PASS || '';
 
 // Professional sender configuration
 const SENDER_DISPLAY_NAME = 'SONA Platform';
-const X_MAILER_ID = 'SONA-Platform-Mailer/2.0';
+const X_MAILER_ID = 'SONA-Platform-Mailer/3.0';
+
+// Initialize Brevo client
+let brevoConfigured = false;
+if (BREVO_API_KEY) {
+  brevoConfigured = true;
+  console.log('[EMAIL] Brevo API initialized - using as primary email provider (sends to ANY email)');
+} else {
+  console.warn('[EMAIL] BREVO_API_KEY not set - Brevo unavailable');
+}
 
 // Initialize Resend client
 let resendClient: Resend | null = null;
 if (RESEND_API_KEY) {
   resendClient = new Resend(RESEND_API_KEY);
-  console.log('[EMAIL] Resend API initialized - using as primary email provider');
+  console.log('[EMAIL] Resend API initialized - using as fallback (limited: only sends to account owner)');
 } else {
-  console.warn('[EMAIL] RESEND_API_KEY not set - falling back to SMTP only');
+  console.warn('[EMAIL] RESEND_API_KEY not set - Resend unavailable');
 }
 
 // Helper: build professional email headers (for SMTP)
@@ -69,13 +85,54 @@ function createTransporter() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// CORE EMAIL SENDING - Resend first, SMTP fallback
+// CORE EMAIL SENDING - Brevo first, Resend fallback, SMTP last resort
 // ═══════════════════════════════════════════════════════════════════
 
 interface SendResult {
   success: boolean;
   error?: string;
   provider?: string;
+}
+
+// Brevo API: Send email via HTTPS (works on Render, sends to ANY address)
+async function sendViaBrevo(to: string, subject: string, html: string, text?: string): Promise<SendResult> {
+  if (!BREVO_API_KEY) {
+    return { success: false, error: 'Brevo not configured' };
+  }
+
+  try {
+    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'api-key': BREVO_API_KEY,
+      },
+      body: JSON.stringify({
+        sender: {
+          name: BREVO_FROM_NAME,
+          email: BREVO_FROM_EMAIL,
+        },
+        to: [{ email: to }],
+        subject,
+        htmlContent: html,
+        textContent: text || undefined,
+      }),
+    });
+
+    if (response.ok) {
+      const data = await response.json().catch(() => ({}));
+      console.log(`[EMAIL][BREVO] Email sent successfully to ${to} (ID: ${data.messageId || 'unknown'})`);
+      return { success: true, provider: 'brevo' };
+    } else {
+      const errorText = await response.text().catch(() => 'Unknown error');
+      console.error(`[EMAIL][BREVO] API error for ${to}: ${response.status} - ${errorText}`);
+      return { success: false, error: `${response.status}: ${errorText}`, provider: 'brevo' };
+    }
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    console.error(`[EMAIL][BREVO] Failed to send to ${to}: ${message}`);
+    return { success: false, error: message, provider: 'brevo' };
+  }
 }
 
 async function sendViaResend(to: string, subject: string, html: string, text?: string): Promise<SendResult> {
@@ -133,9 +190,16 @@ async function sendViaSMTP(to: string, subject: string, html: string, text?: str
   }
 }
 
-// Unified send: try Resend first, fall back to SMTP
+// Unified send: try Brevo first, then Resend, then SMTP
 async function sendEmailUnified(to: string, subject: string, html: string, text?: string): Promise<SendResult> {
-  // Try Resend first (works on Render)
+  // Try Brevo first (works on Render, sends to ANY email address)
+  if (brevoConfigured) {
+    const result = await sendViaBrevo(to, subject, html, text);
+    if (result.success) return result;
+    console.warn(`[EMAIL] Brevo failed, falling back to Resend...`);
+  }
+
+  // Try Resend (works on Render but only sends to account owner without domain verification)
   if (resendClient) {
     const result = await sendViaResend(to, subject, html, text);
     if (result.success) return result;
@@ -146,7 +210,7 @@ async function sendEmailUnified(to: string, subject: string, html: string, text?
   const smtpResult = await sendViaSMTP(to, subject, html, text);
   if (smtpResult.success) return smtpResult;
 
-  // Both failed
+  // All failed
   console.error(`[EMAIL] All email providers failed for ${to}`);
   return { success: false, error: 'فشل إرسال البريد الإلكتروني - جميع الطرق فشلت' };
 }
